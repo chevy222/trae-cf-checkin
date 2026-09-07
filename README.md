@@ -195,6 +195,16 @@ Invoke-RestMethod -Uri "$base/status"
 ```
 返回各账号的昵称、设备号、Token 到期时间、最近一次运行状态（**不会返回 Token 明文**）。
 
+### 8.4 删除某个账号（多账号时用）
+先从 8.3 的结果里找到要删账号的 `uid`（一串数字），然后（需要口令）：
+```powershell
+$body = @{ uid = "要删除账号的uid" } | ConvertTo-Json
+Invoke-RestMethod "$base/remove" -Method Post -Headers $h -ContentType "application/json" -Body $body
+```
+会删掉该账号的凭证、限频状态、最近快照和它的历史日志，其它账号不受影响；返回 `ok=true` 即成功。想保留它的历史日志就把 body 改成 `@{ uid = "..."; keep_logs = $true }`。
+
+> 不想重新部署也能手动删：控制台 **Storage & Databases → KV → 你的命名空间 → View**，搜索该 uid，删除 `acct:<uid>`、`guard:<uid>`、`state:<uid>` 三个键即可（删掉 `acct:` 就不会再被签到；`log:<uid>:*` 是日志，可留着 30 天自动过期）。
+
 ---
 
 ## 9. 接口一览
@@ -207,16 +217,18 @@ Invoke-RestMethod -Uri "$base/status"
 | `/log?id=<日志键>` | GET | 否 | 单条日志详情，只允许读 `log:` 开头的键 |
 | `/login-url` | GET | **是** | 生成 Trae 登录链接 |
 | `/callback` | POST | **是** | 录入凭证，JSON：`{"callback_url":"...","aha_device_id":"..."}` |
+| `/remove` | POST | **是** | 删除账号，JSON：`{"uid":"数字"}`，默认连日志一起删 |
 | `/status` | GET | 否 | 账号与 Token/签到状态（不含 Token 明文），浏览器可直接打开 |
 | `/run` | POST | 否 | 立即手动签到一次（无需任何参数、无需口令） |
 
-> 只有录入凭证的 `/login-url`、`/callback` 需要鉴权头 `X-Admin-Token: <你的 ADMIN_TOKEN>`，用 PowerShell（或 Postman、Apifox）调用；`/status`、`/logs` 浏览器直接打开即可，`/run` 是 POST，用上面的 PowerShell 触发。
+> 录入/删除凭证的 `/login-url`、`/callback`、`/remove` 需要鉴权头 `X-Admin-Token: <你的 ADMIN_TOKEN>`，用 PowerShell（或 Postman、Apifox）调用；`/status`、`/logs` 浏览器直接打开即可，`/run` 是 POST，用上面的 PowerShell 触发。
 
 **习惯用 curl 的话**（Windows 上请用系统自带的 `curl.exe`，不要用 `curl` 别名）：
 ```powershell
 curl.exe -H "X-Admin-Token: 你的口令" "$base/login-url"
 curl.exe -X POST -H "X-Admin-Token: 你的口令" -H "Content-Type: application/json" -d "{\"callback_url\":\"回调地址\",\"aha_device_id\":\"设备号\"}" "$base/callback"
 curl.exe -X POST "$base/run"
+curl.exe -X POST -H "X-Admin-Token: 你的口令" -H "Content-Type: application/json" -d "{\"uid\":\"要删除的uid\"}" "$base/remove"
 ```
 
 ---

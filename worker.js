@@ -5,7 +5,7 @@
  *   scheduled()  Cron 定时触发（控制台配置：每天一次，UTC 表达式见 README 对照表）
  *   fetch()      HTTP：/ 静态页(不执行任务) · /health · /logs · /log
  *                             /status · /run（公开，无需口令）
- *                             /login-url · /callback（需请求头 X-Admin-Token）
+ *                             /login-url · /callback · /remove（需请求头 X-Admin-Token）
  * 存储：一个 KV Namespace，绑定名必须为 KV；一个密钥 ADMIN_TOKEN（仅 /login-url、/callback 用）
  * 对应 Python：trae_work_checkin.py（逻辑对齐：token 预刷新、status 免费先查、
  *   claim 单次、9074 退避状态写 KV 交下一个 Cron；云端不做进程内长睡眠）
@@ -552,8 +552,8 @@ async function handleFetch(req, env) {
     return new Response(JSON.stringify(result), { headers: JSON_H });
   }
 
-  // —— 仅录入凭证的两个接口需要 X-Admin-Token ——
-  if (path === "/login-url" || path === "/callback") {
+  // —— 录入/删除凭证的接口需要 X-Admin-Token ——
+  if (path === "/login-url" || path === "/callback" || path === "/remove") {
     const deny = requireAdmin(req, env);
     if (deny) return deny;
 
@@ -574,6 +574,24 @@ async function handleFetch(req, env) {
       } catch (e) {
         return new Response(JSON.stringify({ ok: false, error: String(e.message || e) }), { status: 400, headers: JSON_H });
       }
+    }
+
+    if (path === "/remove" && method === "POST") { // 删除账号：body {"uid":"数字"}，可选 keep_logs:true 保留历史日志
+      const body = await readJson(req);
+      const uid = String(body.uid || "").trim();
+      if (!/^\d{4,32}$/.test(uid))
+        return new Response(JSON.stringify({ ok: false, error: "参数 uid 必须为数字（先 GET /status 查看）" }), { status: 400, headers: JSON_H });
+      if (!(await env.KV.get(acctKey(uid))))
+        return new Response(JSON.stringify({ ok: false, error: "没有该账号，可能已被删除" }), { status: 404, headers: JSON_H });
+      await env.KV.delete(acctKey(uid));   // 删它即停止签到（runAll 只遍历 acct:）
+      await env.KV.delete(guardKey(uid));  // 限频状态
+      await env.KV.delete(stateKey(uid));  // 最近运行快照
+      let logsDeleted = 0;
+      if (!body.keep_logs) {
+        const { keys: logKeys } = await env.KV.list({ prefix: `log:${uid}:` });
+        for (const k of logKeys) { await env.KV.delete(k.name); logsDeleted++; }
+      }
+      return new Response(JSON.stringify({ ok: true, uid, deleted: ["acct", "guard", "state"], logs_deleted: logsDeleted }), { headers: JSON_H });
     }
 
     return new Response(JSON.stringify({ error: "method not allowed" }), { status: 405, headers: JSON_H });
