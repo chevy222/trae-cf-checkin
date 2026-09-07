@@ -43,7 +43,7 @@
 4. 用记事本打开本目录的 **`worker.js`**，全选复制，整段粘贴进网页编辑器。
 5. 点右上角 **Deploy / 部署**。
 
-部署成功后，访问 `https://<worker名>.<你的子域>.workers.dev/` 能看到一个写着"服务运行中、本页面不执行任何签到任务"的页面，就说明代码上线了。
+部署成功后，访问 `https://<worker名>.<你的子域>.workers.dev/` 能看到首页：已配置账号、**立即签到**、**运行日志**、**可用操作**，就说明代码上线了（首页不执行任何签到任务）。
 
 ---
 
@@ -61,12 +61,12 @@ KV 是 Cloudflare 的键值存储，用来存凭证、限频状态和日志。
 
 ## 4. 第三步：设置管理口令 ADMIN_TOKEN
 
-只有"录入凭证"的两个接口（`/login-url`、`/callback`）需要这个口令，防止别人往你的 KV 写入凭证；查看状态 `/status`、手动签到 `/run`、日志 `/logs` 都是公开的，不需要口令。
+只有"录入/删除凭证"的三个接口（`/login-url`、`/callback`、`/remove`）需要这个口令，防止别人往你的 KV 写入或删除凭证；查看状态 `/status`、手动签到 `/run`、日志 `/logs` 都是公开的，不需要口令。
 
 1. Worker → **Settings** → **Variables and Secrets（变量和机密）** → **Add**。
 2. 类型选 **Secret（加密/机密）**，名称填 **`ADMIN_TOKEN`**，值填一串你自己的口令（建议长一点、随机一点）。
 3. 保存并**重新部署一次**（部分情况下密钥需要重新部署才生效）。
-4. 同一个口令第五步会填进 PowerShell 的 `$token` 变量（只在 7.1、7.3 录入凭证时用到）。
+4. 同一个口令第五步会填进 PowerShell 的 `$token` 变量（在 7.1、7.3 录入凭证和 8.4 删除账号时用到）。
 
 ---
 
@@ -171,9 +171,9 @@ Invoke-RestMethod -Uri "$base/callback" -Method Post -Headers $h -ContentType "a
 
 ### 8.1 立即手动跑一次（不等定时，无需口令）
 ```powershell
-Invoke-RestMethod -Uri "$base/run" -Method Post
+Invoke-RestMethod -Uri "$base/run"
 ```
-返回里 `accounts[0].phase` 含义：
+也就是**直接在浏览器打开 `$base/run`**（GET）即可触发（逻辑与 Cron 一致：受限频闸门/间隔/每日上限保护，只有 Token 临期才刷新）。浏览器会返回结果页；返回的 `accounts[0].phase` 含义：
 - `claimed`：本次签到成功；
 - `already`：今天已经签过了；
 - `rate_limited`：撞上服务器繁忙 9074，已自动安排下个周期再试；
@@ -187,13 +187,14 @@ https://<worker名>.<你的子域>.workers.dev/logs
 ```
 - 最近 50 次运行，每 60 秒自动刷新，按时间倒序；
 - 结果用颜色区分：绿色=成功/已签到，黄色=限频，红色=需重新登录/错误，灰色=跳过；
-- 点"详情"看这一次的完整过程日志；日志只保留 30 天。
+- 每行的「详情」可**在列表内直接展开**这一次的完整过程日志（无需单独页面）；日志只保留 30 天。
 
 ### 8.3 查看账号状态（可选，无需口令）
-```powershell
-Invoke-RestMethod -Uri "$base/status"
+直接用浏览器打开（**不需要口令**）：
 ```
-返回各账号的昵称、设备号、Token 到期时间、最近一次运行状态（**不会返回 Token 明文**）。
+https://<worker名>.<你的子域>.workers.dev/status
+```
+返回每个账号的昵称、设备号、Token 到期时间、最近一次运行状态（**不会返回 Token 明文**）；命令行 `Invoke-RestMethod -Uri "$base/status"` 返回 JSON。
 
 ### 8.4 删除某个账号（多账号时用）
 先从 8.3 的结果里找到要删账号的 `uid`（一串数字），然后（需要口令）：
@@ -211,23 +212,21 @@ Invoke-RestMethod "$base/remove" -Method Post -Headers $h -ContentType "applicat
 
 | 路径 | 方法 | 是否需要 `X-Admin-Token` | 作用 |
 |---|---|---|---|
-| `/` | GET | 否 | 静态说明页，**不执行任何签到** |
-| `/health` | GET | 否 | 存活探针 |
-| `/logs` | GET | 否 | 日志列表页（已脱敏，不含 Token） |
-| `/log?id=<日志键>` | GET | 否 | 单条日志详情，只允许读 `log:` 开头的键 |
+| `/` | GET | 否 | 首页：账号 / 立即签到 / 运行日志 / 可用操作，**不执行任何签到** |
+| `/logs` | GET | 否 | 日志列表页（已脱敏，不含 Token，行内可展开完整日志） |
 | `/login-url` | GET | **是** | 生成 Trae 登录链接 |
 | `/callback` | POST | **是** | 录入凭证，JSON：`{"callback_url":"...","aha_device_id":"..."}` |
 | `/remove` | POST | **是** | 删除账号，JSON：`{"uid":"数字"}`，默认连日志一起删 |
-| `/status` | GET | 否 | 账号与 Token/签到状态（不含 Token 明文），浏览器可直接打开 |
-| `/run` | POST | 否 | 立即手动签到一次（无需任何参数、无需口令） |
+| `/status` | GET | 否 | 账号与 Token/签到状态（不含 Token 明文），浏览器=页面、程序调用=JSON |
+| `/run` | GET | 否 | 立即手动签到一次（逻辑与 Cron 一致，受限频闸门保护），浏览器打开即触发 |
 
-> 录入/删除凭证的 `/login-url`、`/callback`、`/remove` 需要鉴权头 `X-Admin-Token: <你的 ADMIN_TOKEN>`，用 PowerShell（或 Postman、Apifox）调用；`/status`、`/logs` 浏览器直接打开即可，`/run` 是 POST，用上面的 PowerShell 触发。
+> 录入/删除凭证的 `/login-url`、`/callback`、`/remove` 需要鉴权头 `X-Admin-Token: <你的 ADMIN_TOKEN>`，用 PowerShell（或 Postman、Apifox）调用；`/run`、`/status`、`/logs` 浏览器直接打开即可（`/run` 打开就会真的跑一次签到）。
 
 **习惯用 curl 的话**（Windows 上请用系统自带的 `curl.exe`，不要用 `curl` 别名）：
 ```powershell
 curl.exe -H "X-Admin-Token: 你的口令" "$base/login-url"
 curl.exe -X POST -H "X-Admin-Token: 你的口令" -H "Content-Type: application/json" -d "{\"callback_url\":\"回调地址\",\"aha_device_id\":\"设备号\"}" "$base/callback"
-curl.exe -X POST "$base/run"
+curl.exe "$base/run"
 curl.exe -X POST -H "X-Admin-Token: 你的口令" -H "Content-Type: application/json" -d "{\"uid\":\"要删除的uid\"}" "$base/remove"
 ```
 
@@ -239,13 +238,13 @@ curl.exe -X POST -H "X-Admin-Token: 你的口令" -H "Content-Type: application/
 不会。每次先调 status 免费查询，发现"今日已签到"立即收手，只有未签到才发一次 claim。
 
 **Q：返回 9074「当前参与用户太多/操作太频繁」怎么办？**
-两种可能：① 服务器繁忙，这是常态，程序已自动按 30/60/120/240/360 分钟退避，等下一次每日 Cron 即可，也可以随时 `POST /run` 手动补一次；② **Aha 设备号不对**（用成了随机号/UUID）——这种会一直 9074，请回到第五步核对 `aha_device_id` 是 16 位真实数字，并重新第七步录入。
+两种可能：① 服务器繁忙，这是常态，程序已自动按 30/60/120/240/360 分钟退避，等下一次每日 Cron 即可，也可以随时打开 `$base/run` 手动补一次；② **Aha 设备号不对**（用成了随机号/UUID）——这种会一直 9074，请回到第五步核对 `aha_device_id` 是 16 位真实数字，并重新第七步录入。
 
 **Q：日志里出现红色"需重新登录 login_required"？**
 说明 refresh token 也过期了，无法静默续期。重做第 7 步（`login-url` → 登录 → `callback`）即可恢复，KV 里的旧凭证会被覆盖。
 
 **Q：我现在就想签到，不想等定时？**
-随时 `POST /run`（无需口令），手动触发会绕过"间隔/暂停/每日上限"闸门立即尝试（仍只 claim 一次）。
+随时打开 `$base/run`（GET，无需口令）。与 Cron 一致，同样受"间隔/暂停/每日上限"闸门保护；若在上次领取后 30 分钟内，或正处于限频暂停期/已达当日上限，本次会返回"跳过"（phase 为 skipped），不会重复领。
 
 **Q：日志时间是哪个时区？**
 页面和接口都按**北京时间（UTC+8）**显示。Cron 表达式本身是 UTC，对照见第四步。
@@ -257,7 +256,7 @@ curl.exe -X POST -H "X-Admin-Token: 你的口令" -H "Content-Type: application/
 Worker → **Logs / 日志（实时日志）**能看到触发记录；Triggers 页面也能看到 Cron 配置与历史；结果最终都体现在 `/logs`。也可以在 Cron 设置旁边用"手动触发/Run once"测试 `scheduled`。
 
 **Q：`/logs` 是公开的，安全吗？**
-日志页不需要口令是为了方便收藏，但内容**不含任何 Token**，只显示昵称、结果和过程，且 `/log` 被限制只能读日志键。你的 `workers.dev` 地址本身不公开、别人很难猜。如果你仍希望日志页也加口令，可在 `worker.js` 的 `/logs`、`/log` 分支加上和 `/login-url` 一样的口令校验。
+日志页不需要口令是为了方便收藏，但内容**不含任何 Token**，只显示昵称、结果和过程，且日志列表只读 `log:` 前缀的键（无法读到 `acct:` 凭证）。你的 `workers.dev` 地址本身不公开、别人很难猜。如果你仍希望日志页也加口令，可在 `worker.js` 的 `/logs` 分支加上和 `/login-url` 一样的口令校验。
 
 **Q：PowerShell 报 `Invoke-RestMethod` 401 / unauthorized？**
 只有 `/login-url`、`/callback` 需要口令：说明 `$token` 和控制台里的 `ADMIN_TOKEN` 不一致，或密钥设置后没重新部署；检查请求头 `X-Admin-Token`。`/run`、`/status`、`/logs` 不需要口令，别给它们加 `-Headers $h`（加了也不影响）。
@@ -287,7 +286,7 @@ Worker → **Logs / 日志（实时日志）**能看到触发记录；Triggers �
 
 ### 附：文件清单
 ```
-trae-checkin-worker/
+trae-cf-checkin/
 ├── worker.js   # 全部代码（粘贴到 Cloudflare 控制台）
 └── README.md   # 本说明
 ```

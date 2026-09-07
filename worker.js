@@ -3,10 +3,14 @@
  * ------------------------------------------------------------------------
  * 入口：
  *   scheduled()  Cron 定时触发（控制台配置：每天一次，UTC 表达式见 README 对照表）
- *   fetch()      HTTP：/ 静态页(不执行任务) · /health · /logs · /log
- *                             /status · /run（公开，无需口令）
- *                             /login-url · /callback · /remove（需请求头 X-Admin-Token）
- * 存储：一个 KV Namespace，绑定名必须为 KV；一个密钥 ADMIN_TOKEN（仅 /login-url、/callback 用）
+ *   fetch()      HTTP：
+ *     /          首页（账号 / 立即签到 / 运行日志 / 可用操作，不执行任务）
+ *     /run       GET 公开，手动签到（与 Cron 同逻辑，受限频闸门保护）
+ *     /status    GET 公开，账号与 Token 碰撞状态（浏览器=页面，程序调用=JSON）
+ *     /logs      GET 公开，运行日志列表（60 秒自动刷新，行内可展开完整日志）
+ *     /login-url、/callback、/remove   仅需请求头 X-Admin-Token
+ *   （已移除 /health 与 /log?id= 接口）
+ * 存储：一个 KV Namespace，绑定名必须为 KV；一个密钥 ADMIN_TOKEN（仅 /login-url、/callback、/remove 用）
  * 对应 Python：trae_work_checkin.py（逻辑对齐：token 预刷新、status 免费先查、
  *   claim 单次、9074 退避状态写 KV 交下一个 Cron；云端不做进程内长睡眠）
  */
@@ -107,7 +111,7 @@ async function setJSON(kv, key, val, opts) {
 
 async function loadGuard(kv, uid) {
   const today = cstDay(nowSec());
-  const def = { date: today, last_attempt: null, daily_attempts: 0, consecutive_rate_limits: 0, paused_until: null, last_success: null };
+  const def = { date: today, last_attempt: null, daily_attempts: 0, consecutive_rate_limits: 0, paused_until: null };
   const g = await getJSON(kv, guardKey(uid), null);
   const merged = g ? { ...def, ...g } : def;
   if (merged.date !== today) { // 跨天重置
@@ -272,12 +276,9 @@ async function provision(env, body, logger) {
   const acct = {
     uid,
     nickname: info.nickname || parsed.nickname || "",
-    enterprise_id: info.enterprise_id || parsed.ent_id || "",
     access_token: accessToken,
     refresh_token: refreshToken,
     expires_at: expiresAt,
-    machine_id: randHex(16),       // 仅 OAuth 过程使用
-    oauth_device_id: randHex(16),  // 仅 OAuth 过程使用（claim 一律用 aha_device_id）
     aha_device_id: aha,
     created_at: now, updated_at: now,
   };
@@ -290,7 +291,7 @@ async function provision(env, body, logger) {
 // ============================================================
 // 单账号一次运行（Cron / 手动共用；云端不睡眠，9074 交下一 Cron）
 // ============================================================
-async function runAccount(env, acct, { trigger, force, logger }) {
+async function runAccount(env, acct, { trigger, logger }) {
   const kv = env.KV, uid = acct.uid;
 
   // —— 乐观并发锁（KV 无 CAS，尽力而为，TTL 自动回收）——
@@ -304,7 +305,7 @@ async function runAccount(env, acct, { trigger, force, logger }) {
     // —— 1) Token 预刷新 ——
     let cred = acct;
     const remaining = (cred.expires_at || 0) - nowSec();
-    if (force || remaining <= REFRESH_AHEAD_SEC) {
+    if (remaining <= REFRESH_AHEAD_SEC) {
       try {
         const tok = await exchangeToken(cred.refresh_token);
         cred = { ...cred, ...tok, updated_at: nowSec() };
@@ -322,27 +323,30 @@ async function runAccount(env, acct, { trigger, force, logger }) {
     const aha = String(cred.aha_device_id || "");
     if (!/^\d{8,16}$/.test(aha)) throw new Error("缺少合法 aha_device_id，请重新走 /callback 录入");
 
-    // —— 2) 限频三道闸门（手动 force 时绕过）——
+    // —— 2) 限频三道闸门 ——
     const guard = await loadGuard(kv, uid);
     const now = nowSec();
-    if (!force) {
-      if (guard.paused_until && now < guard.paused_until)
-        return { ok: false, phase: "skipped", message: `限频暂停至 ${fmtCST(guard.paused_until)}` };
-      if (guard.last_attempt && now - guard.last_attempt < MIN_CLAIM_INTERVAL_SEC)
-        return { ok: false, phase: "skipped", message: "距上次领取不足 30 分钟" };
-      if ((guard.daily_attempts || 0) >= MAX_DAILY_ATTEMPTS)
-        return { ok: false, phase: "skipped", message: "当日 claim 已达上限" };
-    }
+    if (guard.paused_until && now < guard.paused_until)
+      return { ok: false, phase: "skipped", message: `限频暂停至 ${fmtCST(guard.paused_until)}` };
+    if (guard.last_attempt && now - guard.last_attempt < MIN_CLAIM_INTERVAL_SEC)
+      return { ok: false, phase: "skipped", message: "距上次领取不足 30 分钟" };
+    if ((guard.daily_attempts || 0) >= MAX_DAILY_ATTEMPTS)
+      return { ok: false, phase: "skipped", message: "当日 claim 已达上限" };
 
     // —— 3) 先免费查状态，已签即收手 ——
     logger.info("查询签到状态…");
     const status = await apiStatus(cred.access_token, aha);
-    if (!status || status._http_error) return { ok: false, phase: "error", message: "签到状态查询失败" };
+    if (status && (status._http_error === 401 || status._http_error === 403))
+      throw new AuthError(`签到状态查询返回 HTTP ${status._http_error}，登录态已失效，需重新走 /callback 录入`);
+    if (!status || status._http_error)
+      return { ok: false, phase: "error", message: `签到状态查询失败（HTTP ${status ? status._http_error : "网络异常"}）` };
     if (status.checked_in) {
       guard.consecutive_rate_limits = 0; guard.paused_until = null;
       await setJSON(kv, guardKey(uid), guard);
-      logger.info("今日已签到，当前签到积分", status.credits || 0);
-      return { ok: true, phase: "already", message: "今日已签到", checked_in: true, credits: status.credits || 0 };
+      const message = (status.credits != null && status.credits !== "")
+        ? `今日已签到，当前签到积分 ${status.credits}` : "今日已签到";
+      logger.info(message);
+      return { ok: true, phase: "already", message, checked_in: true, credits: status.credits || 0 };
     }
     if (status.enable === false) return { ok: false, phase: "error", message: "签到功能未启用" };
 
@@ -357,18 +361,39 @@ async function runAccount(env, acct, { trigger, force, logger }) {
       await setJSON(kv, guardKey(uid), guard);
       return { ok: false, phase: "error", message: "领取请求失败：" + e.message };
     }
+    if (result._http_error === 401 || result._http_error === 403) {
+      await setJSON(kv, guardKey(uid), guard); // 先落 attempt 计数，再按登录失效上抛
+      throw new AuthError(`领取接口返回 HTTP ${result._http_error}，登录态已失效，需重新走 /callback 录入`);
+    }
     if (result._http_error) result = { code: result._http_error, message: `HTTP ${result._http_error}` };
 
     const code = result.code || 0;
     const msg = result.message || "";
     const low = msg.toLowerCase();
 
-    if (code === 0 || !msg || low.includes("success") || low.includes("ok")) {
-      guard.consecutive_rate_limits = 0; guard.paused_until = null; guard.last_success = now;
+    if (code === 0 || low.includes("success")) {
+      guard.consecutive_rate_limits = 0; guard.paused_until = null;
       await setJSON(kv, guardKey(uid), guard);
-      logger.info("签到成功：", msg || "success");
+      // 本次新增积分：优先取 claim 返回的 credits；没有则再查一次免费 status，
+      // 用领取前后的签到积分差值算出（领取前数值缺失时只展示当前值，不算差值以免虚报）
+      let gained = Number(result.credits) || 0;
+      let curCredits = null;
+      if (!gained) {
+        const after = await apiStatus(cred.access_token, aha).catch(() => null);
+        if (after && !after._http_error) {
+          const pre = Number(status.credits), post = Number(after.credits);
+          if (Number.isFinite(post)) {
+            curCredits = post;
+            if (Number.isFinite(pre)) gained = Math.max(0, post - pre);
+          }
+        }
+      }
+      const message = gained > 0
+        ? `签到成功，本次 +${gained} 积分`
+        : (curCredits != null ? `签到成功，当前签到积分 ${curCredits}` : `签到成功（${msg || "success"}）`);
+      logger.info(message);
       const usage = await apiUsage(cred.access_token, aha).catch(() => null);
-      return { ok: true, phase: "claimed", message: msg || "签到成功", credits: result.credits || 0, usage };
+      return { ok: true, phase: "claimed", message, credits: gained, usage };
     }
     if (low.includes("already") || msg.includes("已")) {
       guard.consecutive_rate_limits = 0; guard.paused_until = null;
@@ -394,7 +419,7 @@ async function runAccount(env, acct, { trigger, force, logger }) {
 }
 
 // 遍历所有账号；每个账号结束写 state + 一条 log
-async function runAll(env, trigger, force) {
+async function runAll(env, trigger) {
   const kv = env.KV;
   const list = await kv.list({ prefix: "acct:" });
   const out = [];
@@ -404,7 +429,7 @@ async function runAll(env, trigger, force) {
     const logger = makeLogger();
     const summary = { uid: acct.uid, nickname: acct.nickname || "", ok: false, phase: "error", message: "" };
     try {
-      Object.assign(summary, await runAccount(env, acct, { trigger, force, logger }));
+      Object.assign(summary, await runAccount(env, acct, { trigger, logger }));
     } catch (e) {
       if (e instanceof AuthError) {
         summary.phase = "login_required";
@@ -418,8 +443,8 @@ async function runAll(env, trigger, force) {
       const ts = nowSec();
       const tsMs = Date.now(); // 毫秒，避免同账号同秒多次运行覆盖日志
       await setJSON(kv, stateKey(acct.uid), { last_run_at: ts, trigger, ...summary });
-      const logName = `log:${acct.uid}:${cstDay(ts).replace(/-/g, "")}:${tsMs}`;
-      const body = `# ${acct.nickname || acct.uid}  ${fmtCST(ts)} (${trigger}${force ? ",manual" : ""})\n` +
+      const logName = `log:${tsMs}:${acct.uid}`; // 时间戳在前：KV 键序即全局时间序
+      const body = `# ${acct.nickname || acct.uid}  ${fmtCST(ts)} (${trigger})\n` +
         `结果：${summary.phase}  ${summary.message}\n\n${logger.text()}\n`;
       await kv.put(logName, body, {
         expirationTtl: LOG_TTL,
@@ -428,12 +453,47 @@ async function runAll(env, trigger, force) {
       out.push(summary);
     }
   }
-  return { ran_at: fmtCST(nowSec()), trigger, force, count: out.length, accounts: out };
+  return { ran_at: fmtCST(nowSec()), trigger, count: out.length, accounts: out };
 }
 
 // ============================================================
-// /logs 日志页（公开、不含任何 token）
+// 页面（与 WorkBuddy 版同风格的统一样式）
 // ============================================================
+const PAGE_CSS = `
+*{box-sizing:border-box;}
+body{margin:0;background:#F4F3EE;color:#1A1B1C;font-family:'PingFang SC','Segoe UI','Microsoft YaHei',Arial,sans-serif;line-height:1.6;font-size:13.5px;}
+.wrap{max-width:920px;margin:0 auto;padding:20px 14px 40px;}
+.hd{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px;}
+h2{font-size:17px;margin:0;font-weight:600;}
+h3{font-size:14px;margin:16px 0 6px;}
+.sub{font-size:12px;color:#6B7280;}
+hr{border:none;border-top:1px solid #E4E3DD;margin:12px 0;}
+a{color:#2E7E96;text-decoration:none;} a:hover{text-decoration:underline;}
+code{background:rgba(46,126,150,.08);border:1px solid rgba(46,126,150,.18);border-radius:4px;padding:0 4px;font-size:12px;}
+.tbl-scroll{overflow-x:auto;}
+table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #E4E3DD;border-radius:12px;overflow:hidden;}
+th{text-align:left;background:rgba(163,213,232,.18);font-size:12px;color:#374151;padding:8px 10px;font-weight:600;white-space:nowrap;}
+td{padding:8px 10px;font-size:13px;border-top:1px solid #F0EFEA;vertical-align:top;}
+.badge{display:inline-block;padding:2px 9px;border-radius:10px;font-size:12px;white-space:nowrap;}
+.card{background:#fff;border:1px solid #E4E3DD;border-radius:12px;padding:12px 14px;margin:10px 0;}
+.cardhd{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:4px;}
+.accname{font-weight:600;font-size:14px;}
+.report{font-size:13.5px;color:#1F2937;word-break:break-word;}
+.meta{font-size:12px;color:#6B7280;margin-top:5px;word-break:break-word;}
+pre{white-space:pre-wrap;word-break:break-all;background:#fff;border:1px solid #E4E3DD;border-radius:12px;padding:14px;font-size:12.5px;line-height:1.6;}
+details{margin-top:8px;} summary{cursor:pointer;color:#6B7280;font-size:12.5px;}
+.btnrow a{display:inline-block;padding:6px 14px;border:1px solid #CFDADF;background:#fff;border-radius:999px;font-size:13px;margin:0 8px 8px 0;}
+.warn{border-color:rgba(234,102,104,.45);}
+`;
+
+function pageShell(title, inner, autoRefresh) {
+  return "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">" +
+    '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+    (autoRefresh ? '<meta http-equiv="refresh" content="60">' : "") +
+    "<title>" + escapeHtml(title) + "</title><style>" + PAGE_CSS + "</style></head>" +
+    '<body><div class="wrap">' + inner + '</div></body></html>';
+}
+
 const PHASE_LABEL = {
   claimed: ["成功", "#2F6B12", "rgba(82,196,26,.14)"],
   already: ["已签到", "#2F6B12", "rgba(82,196,26,.14)"],
@@ -444,43 +504,173 @@ const PHASE_LABEL = {
 };
 function badge(phase) {
   const [label, color, bg] = PHASE_LABEL[phase] || [phase || "-", "#5B6470", "rgba(0,0,0,.05)"];
-  return `<span style="display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px;color:${color};background:${bg};">${escapeHtml(label)}</span>`;
+  return `<span class="badge" style="color:${color};background:${bg};">${escapeHtml(label)}</span>`;
 }
-function pageShell(title, inner) {
-  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="60">
-<title>${escapeHtml(title)}</title></head>
-<body style="margin:0;background:#F4F3EE;color:#1A1B1C;font-family:'PingFang SC','Segoe UI',Arial,sans-serif;line-height:1.6;">
-<div style="max-width:860px;margin:0 auto;padding:20px 14px;">${inner}</div></body></html>`;
+
+// 工具条：首页 / 立即签到 / 运行日志 / 账号状态
+function toolbar() {
+  return `<div class="btnrow" style="margin-top:4px;">` +
+    `<a href="/run">▶ 立即签到</a>` +
+    `<a href="/logs">运行日志</a>` +
+    `<a href="/status">账号状态</a>` +
+    `<a href="/">首页</a>` +
+    `</div>`;
 }
+
+/* —— 首页：账号 + 立即签到 + 运行日志 + 可用操作（对齐 WorkBuddy 首页） —— */
+async function renderHome(env) {
+  let accBlock;
+  try {
+    const { keys } = await env.KV.list({ prefix: "acct:" });
+    const accounts = [];
+    for (const { name } of keys) {
+      const a = await getJSON(env.KV, name, null);
+      if (a && a.uid) accounts.push(a);
+    }
+    if (accounts.length) {
+      const lines = accounts.map((a) => {
+        const nm = a.nickname || (a.uid ? "UID " + String(a.uid).slice(-4) : "未命名");
+        const left = Math.floor(((a.expires_at || 0) - nowSec()) / 86400);
+        let t = escapeHtml(nm);
+        if (a.expires_at) {
+          if (left < 0) t += `，<span style="color:#B03A3C;">令牌已过期（${fmtCST(a.expires_at)}）</span>`;
+          else if (left <= 7) t += `，<span style="color:#B03A3C;">令牌剩 ${left} 天（${fmtCST(a.expires_at)} 到期）</span>`;
+          else t += `，令牌剩 ${left} 天（${fmtCST(a.expires_at)} 到期）`;
+        }
+        return t;
+      });
+      accBlock = '<div class="card">已配置 <b>' + accounts.length + "</b> 个账号：<br>" + lines.join("<br>") + "</div>";
+    } else {
+      accBlock = '<div class="card">当前配置 <b>0</b> 个账号。通过 <code>/login-url</code> 生成登录链接、<code>/callback</code> 录入（需 <code>X-Admin-Token</code>）后即可开始签到。</div>';
+    }
+  } catch (e) {
+    accBlock = '<div class="card warn" style="color:#B03A3C;">' + escapeHtml(String(e.message || e)) + "</div>";
+  }
+
+  const rows = [
+    ["<a href=\"/run\">/run</a>", "立即签到（GET，逻辑与 Cron 相同，受限频闸门保护）"],
+    ["<a href=\"/status\">/status</a>", "查看账号与 Token 到期 / 最近一次运行状态"],
+    ["<a href=\"/logs\">/logs</a>", "最近 " + LOG_LIST_LIMIT + " 次运行日志（60 秒自动刷新，可展开详情）"],
+    ["/login-url", "生成 Trae 登录链接（GET，需 X-Admin-Token）"],
+    ["/callback", "录入 / 更新凭证（POST，需 X-Admin-Token，JSON 见 README）"],
+    ["/remove", "删除某账号及其日志（POST，需 X-Admin-Token）"],
+  ].map(([path, desc]) =>
+    "<tr><td style=\"white-space:nowrap;\">" + path + "</td><td class=\"sub\">" + desc + "</td></tr>"
+  ).join("");
+
+  const inner =
+    '<div class="hd"><h2>Trae 签到 Worker</h2><span class="sub">云端自动签到 · Token 自动续期 · 幂等可重复执行</span></div>' +
+    accBlock +
+    '<div class="btnrow" style="margin-top:6px;"><a href="/run">▶ 立即签到</a><a href="/logs">运行日志</a></div>' +
+    '<h3>可用操作</h3><div class="tbl-scroll"><table><tbody>' + rows + "</tbody></table></div>" +
+    '<p class="sub" style="margin-top:12px;">提示：<code>/run</code>、<code>/status</code>、<code>/logs</code> 公开、浏览器可直接打开；录入/删除凭证的 <code>/login-url</code>、<code>/callback</code>、<code>/remove</code> 需请求头 <code>X-Admin-Token</code>。程序调用时返回 JSON。</p>';
+  return htmlRes(pageShell("Trae 签到 Worker", inner, false));
+}
+
+/* —— /status：账号与 Token 状态页 —— */
+async function renderStatus(env) {
+  const { keys } = await env.KV.list({ prefix: "acct:" });
+  const cards = [];
+  let any = false;
+  for (const { name } of keys) {
+    const a = await getJSON(env.KV, name, null);
+    if (!a || !a.uid) continue;
+    any = true;
+    const st = await getJSON(env.KV, stateKey(a.uid), {});
+    const nm = a.nickname || (a.uid ? "UID " + String(a.uid).slice(-4) : "未命名");
+    const left = Math.floor(((a.expires_at || 0) - nowSec()) / 86400);
+    const expireMiddle = !a.expires_at ? "-"
+      : (left < 0 ? `<span style="color:#B03A3C;">已过期</span>` : "剩 " + left + " 天");
+    const expireTail = a.expires_at ? " · " + fmtCST(a.expires_at) : "";
+    const meta = [
+      "UID " + String(a.uid).replace(/(\d{4})\d+(\d{4})/, "$1••••$2"),
+      "设备号 " + String(a.aha_device_id || "-").replace(/(\d{4})\d+(\d{4})/, "$1••••••••$2"),
+      "Token 到期：" + expireMiddle + expireTail,
+      "上次运行：" + (st.last_run_at ? fmtCST(st.last_run_at) + " · " + (st.trigger || "") : "暂无"),
+    ];
+    cards.push(`<div class="card"><div class="cardhd"><span class="accname">${escapeHtml(nm)}</span>${badge(st.phase)}</div>` +
+      `<div class="report">${escapeHtml(st.message || (st.ok ? "状态正常" : "尚未运行"))}</div>` +
+      `<div class="meta">${meta.map(escapeHtml).join(" · ")}</div>` +
+      `<details><summary>查看原始 JSON</summary><pre>${escapeHtml(JSON.stringify({ account: { uid: a.uid, nickname: a.nickname, aha_device_id: a.aha_device_id, token_expires_at: fmtCST(a.expires_at) }, state: st }, null, 2))}</pre></details></div>`);
+  }
+  const body = any
+    ? cards.join("")
+    : '<div class="card">尚未录入任何账号。通过 <code>/login-url</code> + <code>/callback</code>（需 <code>X-Admin-Token</code>）录入后此页会展示账号与 Token 状态。</div>';
+  const inner =
+    '<div class="hd"><h2>Trae 账号状态</h2><span class="sub">Token 到期 / 最近运行 · 不显示 Token 明文</span></div>' +
+    toolbar() + body +
+    '<p class="sub" style="margin-top:8px;">本页不含任何 Token；程序调用时返回 JSON。</p>';
+  return htmlRes(pageShell("Trae 账号状态", inner, true));
+}
+
+/* —— /run：手动签到结果页 —— */
+function renderRunResult(result) {
+  const cards = (result.accounts || []).map((s) => {
+    const nm = s.nickname || (s.uid ? "UID " + String(s.uid).slice(-4) : "未命名");
+    const meta = [];
+    if (s.phase === "already" && s.credits != null) meta.push("当前签到积分 " + s.credits);
+    else if (s.credits) meta.push("本次 +" + s.credits + " 积分");
+    if (s.usage && s.usage.remaining != null) meta.push("剩余 " + s.usage.remaining + " 积分额度");
+    return '<div class="card"><div class="cardhd"><span class="accname">' + escapeHtml(nm) + "</span>" + badge(s.phase) + "</div>" +
+      '<div class="report">' + escapeHtml(s.message || "-") + "</div>" +
+      (meta.length ? '<div class="meta">' + meta.map(escapeHtml).join(" · ") + "</div>" : "") +
+      "</div>";
+  }).join("");
+  const inner =
+    '<div class="hd"><h2>签到执行结果</h2><span class="sub">' + escapeHtml(result.ran_at) + " · 共 " + result.count + " 个账号</span></div>" +
+    toolbar() + cards +
+    "<details><summary>查看本次完整 JSON</summary><pre>" + escapeHtml(JSON.stringify(result, null, 2)) + "</pre></details>";
+  return htmlRes(pageShell("Trae 签到结果", inner, false)); // 不自动刷新，避免定时重复执行
+}
+
+/* —— /logs 日志列表（行内可展开完整日志，无独立详情页） —— */
+// 拉取日志键（自动翻页，上限 10 页防御异常数据量），按 metadata.ts 倒序取最近 LOG_LIST_LIMIT 条。
+// 兼容新旧两种键格式（log:uid:日期:ms 与 log:ms:uid）：排序与账号过滤一律依据 metadata，不依赖 KV 键序。
+async function listLogEntries(kv, filterUid) {
+  const all = [];
+  let cursor;
+  for (let i = 0; i < 10; i++) {
+    const page = await kv.list({ prefix: "log:", limit: 1000, cursor });
+    for (const k of page.keys) {
+      const m = k.metadata || {};
+      if (filterUid && String(m.uid || "") !== String(filterUid)) continue;
+      all.push({ name: k.name, m });
+    }
+    if (page.list_complete) break;
+    cursor = page.cursor;
+  }
+  all.sort((a, b) => (b.m.ts || 0) - (a.m.ts || 0));
+  return all.slice(0, LOG_LIST_LIMIT);
+}
+
 async function renderLogs(env, filterUid) {
-  const kv = env.KV;
-  const opts = { prefix: filterUid ? `log:${filterUid}:` : "log:", limit: LOG_LIST_LIMIT, reverse: true };
-  const { keys } = await kv.list(opts);
-  const rows = keys.map((k) => {
-    const m = k.metadata || {};
-    return `<tr>
+  const entries = await listLogEntries(env.KV, filterUid);
+  const rowHtml = [];
+  for (const k of entries) {
+    const m = k.m;
+    const body = (await env.KV.get(k.name)) || "";
+    rowHtml.push(`<tr>
       <td style="padding:8px 10px;white-space:nowrap;color:#6B7280;font-size:12px;">${escapeHtml(fmtCST(m.ts))}</td>
       <td style="padding:8px 10px;">${badge(m.phase)}</td>
       <td style="padding:8px 10px;font-size:13px;">${escapeHtml(m.nick || (m.uid ? "UID " + String(m.uid).slice(-4) : "-"))}</td>
       <td style="padding:8px 10px;font-size:13px;color:#374151;">${escapeHtml(m.msg || "")}</td>
-      <td style="padding:8px 10px;"><a href="/log?id=${encodeURIComponent(k.name)}" style="color:#2E7E96;font-size:12px;text-decoration:none;">详情</a></td>
-    </tr>`;
-  }).join("");
+      <td style="padding:8px 10px;"><details><summary style="color:#2E7E96;font-size:12px;cursor:pointer;">详情</summary>
+        <pre style="margin-top:6px;max-height:320px;overflow:auto;">${escapeHtml(body)}</pre></details></td>
+    </tr>`);
+  }
+  const rows = rowHtml.join("");
   const inner = `
-    <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px;">
-      <h2 style="font-size:17px;margin:0;">Trae 签到运行日志</h2>
-      <span style="font-size:12px;color:#6B7280;">最近 ${LOG_LIST_LIMIT} 条 · 每 60 秒自动刷新 · 仅保留 30 天</span>
-    </div>
-    <hr style="border:none;border-top:1px solid #E4E3DD;margin:12px 0;">
-    ${rows ? `<table style="width:100%;border-collapse:collapse;background:#fff;border:1px solid #E4E3DD;border-radius:12px;overflow:hidden;">
+    <div class="hd"><h2>Trae 签到运行日志</h2>
+    <span class="sub">最近 ${LOG_LIST_LIMIT} 条 · 每 60 秒自动刷新 · 仅保留 30 天</span></div>
+    ${toolbar()}
+    <hr>
+    ${rows ? `<div class="tbl-scroll"><table>
       <thead><tr style="text-align:left;background:rgba(163,213,232,.18);font-size:12px;color:#374151;">
         <th style="padding:8px 10px;font-weight:600;">时间(北京)</th><th style="padding:8px 10px;font-weight:600;">结果</th>
         <th style="padding:8px 10px;font-weight:600;">账号</th><th style="padding:8px 10px;font-weight:600;">说明</th><th></th>
-      </tr></thead><tbody>${rows}</tbody></table>`
-      : `<div style="padding:18px;background:#fff;border:1px solid #E4E3DD;border-radius:12px;color:#6B7280;font-size:13px;">暂无运行记录（Cron 触发或 /run 后出现）。</div>`}`;
-  return htmlRes(pageShell("Trae 签到日志", inner));
+      </tr></thead><tbody>${rows}</tbody></table></div>`
+      : `<div class="card sub">暂无运行记录（Cron 定时触发或访问 <code>/run</code> 后出现）。</div>`}`;
+  return htmlRes(pageShell("Trae 签到日志", inner, true));
 }
 
 // ============================================================
@@ -490,47 +680,41 @@ function requireAdmin(req, env) {
   if (!env.ADMIN_TOKEN)
     return new Response(JSON.stringify({ error: "服务端未配置 ADMIN_TOKEN 密钥" }), { status: 500, headers: JSON_H });
   const got = req.headers.get("X-Admin-Token") || "";
-  if (!safeEqual(got, env.ADMIN_TOKEN))
+  if (!safeEqual(got, env.ADMIN_TOKEN)) {
+    if ((req.headers.get("accept") || "").includes("text/html"))
+      return new Response(pageShell("未授权",
+        '<div class="card warn" style="color:#B03A3C;">此接口需要管理员口令：请用 PowerShell / curl 携带请求头 <code>X-Admin-Token</code> 调用（用法见 README）。</div>', false),
+        { status: 401, headers: HTML_H });
     return new Response(JSON.stringify({ error: "unauthorized：需要 X-Admin-Token 头" }), { status: 401, headers: JSON_H });
+  }
   return null;
 }
 async function readJson(req) { try { return await req.json(); } catch { return {}; } }
+// 浏览器查看时渲染页面；非浏览器调用时返回 JSON
+function wantsHtml(url, req) {
+  return (req.headers.get("accept") || "").includes("text/html");
+}
 
 async function handleFetch(req, env) {
   const url = new URL(req.url);
   const path = url.pathname;
   const method = req.method.toUpperCase();
 
-  // —— 根路径：纯静态说明，绝不执行任何任务 ——
+  // —— 根路径：首页（账号 / 立即签到 / 运行日志 / 可用操作，绝不执行任务）——
   if (path === "/" && method === "GET") {
-    const inner = `
-      <h2 style="font-size:18px;">Trae 签到 Worker</h2>
-      <p style="font-size:14px;color:#374151;">服务运行中。本页面<strong>不执行任何签到任务</strong>，任务只由 Cron 定时或 POST <code>/run</code> 触发。</p>
-      <p style="font-size:14px;">
-        <a href="/logs" style="color:#2E7E96;">运行日志 /logs</a>　·　
-        <a href="/status" style="color:#2E7E96;">账号状态 /status</a>　·　
-        <a href="/health" style="color:#2E7E96;">/health</a>
-      </p>
-      <p style="font-size:12px;color:#6B7280;">仅录入凭证用的 /login-url、/callback 需要请求头 X-Admin-Token；/run、/status、/logs 均公开。</p>`;
-    return htmlRes(pageShell("Trae 签到 Worker", inner));
+    if (wantsHtml(url, req)) return renderHome(env);
+    return new Response(JSON.stringify({
+      ok: true,
+      report: "Trae 签到 Worker 运行中。路径：/run（立即签到）、/status（账号状态）、/logs（运行日志）；浏览器访问为可视化页面。录入/删除凭证的 /login-url、/callback、/remove 需请求头 X-Admin-Token。",
+    }), { headers: JSON_H });
   }
 
-  if (path === "/health" && method === "GET")
-    return new Response(JSON.stringify({ ok: true, time: fmtCST(nowSec()) }), { headers: JSON_H });
-
-  // —— 公开只读日志（无口令，内容已脱敏）——
-  if (path === "/logs" && method === "GET")
-    return renderLogs(env, url.searchParams.get("uid"));
-  if (path === "/log" && method === "GET") {
-    const id = url.searchParams.get("id") || "";
-    if (!id.startsWith("log:")) return new Response("非法日志 id", { status: 400 }); // 白名单前缀，杜绝读到 acct:
-    const text = (await env.KV.get(id)) || "记录不存在或已过期";
-    const inner = `<p><a href="/logs" style="color:#2E7E96;font-size:13px;text-decoration:none;">← 返回列表</a></p>
-      <pre style="white-space:pre-wrap;word-break:break-all;background:#fff;border:1px solid #E4E3DD;border-radius:12px;padding:14px;font-size:12.5px;line-height:1.6;">${escapeHtml(text)}</pre>`;
-    return htmlRes(pageShell("日志详情", inner));
+  // —— 公开：运行日志列表 / 账号状态 / 立即签到（均为 GET）——
+  if (path === "/logs" && method === "GET") {
+    const uid = url.searchParams.get("uid");
+    return wantsHtml(url, req) ? renderLogs(env, uid) : renderLogsJson(env, uid);
   }
 
-  // —— 公开：账号状态（不含任何 token）——
   if (path === "/status" && method === "GET") {
     const { keys } = await env.KV.list({ prefix: "acct:" });
     const accounts = [];
@@ -543,14 +727,17 @@ async function handleFetch(req, env) {
         token_expires: fmtCST(a.expires_at), state: st, // 不含任何 access/refresh token
       });
     }
+    if (wantsHtml(url, req)) return renderStatus(env);
     return new Response(JSON.stringify({ accounts }), { headers: JSON_H });
   }
 
-  // —— 公开：手动触发（手动即强制，无参数）——
-  if (path === "/run" && method === "POST") {
-    const result = await runAll(env, "manual", true);
+  if (path === "/run" && method === "GET") {
+    const result = await runAll(env, "manual"); // 与 Cron 一致：走完整闸门（限频暂停/间隔/每日上限）
+    if (wantsHtml(url, req)) return renderRunResult(result);
     return new Response(JSON.stringify(result), { headers: JSON_H });
   }
+  if (path === "/run" && method === "POST")
+    return new Response(JSON.stringify({ error: "method not allowed：/run 请用 GET 访问" }), { status: 405, headers: JSON_H });
 
   // —— 录入/删除凭证的接口需要 X-Admin-Token ——
   if (path === "/login-url" || path === "/callback" || path === "/remove") {
@@ -588,8 +775,20 @@ async function handleFetch(req, env) {
       await env.KV.delete(stateKey(uid));  // 最近运行快照
       let logsDeleted = 0;
       if (!body.keep_logs) {
-        const { keys: logKeys } = await env.KV.list({ prefix: `log:${uid}:` });
-        for (const k of logKeys) { await env.KV.delete(k.name); logsDeleted++; }
+        // 按元数据 uid 匹配删除，兼容新旧两种键格式（log:uid:日期:ms 与 log:ms:uid）
+        let cursor;
+        for (let i = 0; i < 10; i++) {
+          const page = await env.KV.list({ prefix: "log:", limit: 1000, cursor });
+          for (const k of page.keys) {
+            const m = k.metadata || {};
+            if (String(m.uid || "") === uid || k.name.startsWith(`log:${uid}:`)) {
+              await env.KV.delete(k.name);
+              logsDeleted++;
+            }
+          }
+          if (page.list_complete) break;
+          cursor = page.cursor;
+        }
       }
       return new Response(JSON.stringify({ ok: true, uid, deleted: ["acct", "guard", "state"], logs_deleted: logsDeleted }), { headers: JSON_H });
     }
@@ -597,7 +796,20 @@ async function handleFetch(req, env) {
     return new Response(JSON.stringify({ error: "method not allowed" }), { status: 405, headers: JSON_H });
   }
 
+  if ((req.headers.get("accept") || "").includes("text/html"))
+    return new Response(pageShell("Not Found",
+      '<div class="card">页面不存在。返回 <a href="/">首页</a>，可用路径：/run、/status、/logs。</div>', false),
+      { status: 404, headers: HTML_H });
   return new Response("Not Found", { status: 404 });
+}
+
+// /logs 的 JSON 输出（复用列表逻辑；uid 打码、不暴露键名，与页面脱敏一致）
+async function renderLogsJson(env, filterUid) {
+  const mask = (v) => String(v || "").replace(/(\d{4})\d+(\d{4})/, "$1••••$2");
+  const logs = (await listLogEntries(env.KV, filterUid)).map((k) => ({
+    ts: k.m.ts, uid: mask(k.m.uid), nick: k.m.nick, ok: k.m.ok, phase: k.m.phase, msg: k.m.msg,
+  }));
+  return new Response(JSON.stringify({ count: logs.length, logs }), { headers: JSON_H });
 }
 
 export default {
@@ -607,7 +819,7 @@ export default {
       return new Response(JSON.stringify({ error: String((e && e.message) || e) }), { status: 500, headers: JSON_H });
     }
   },
-  async scheduled(_controller, env) { // Cron：非强制，走完整闸门
-    await runAll(env, "cron", false);
+  async scheduled(_controller, env) { // Cron：走完整闸门
+    await runAll(env, "cron");
   },
 };
