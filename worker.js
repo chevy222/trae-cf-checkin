@@ -480,7 +480,7 @@ async function renderLogs(env, filterUid) {
         <th style="padding:8px 10px;font-weight:600;">账号</th><th style="padding:8px 10px;font-weight:600;">说明</th><th></th>
       </tr></thead><tbody>${rows}</tbody></table>`
       : `<div style="padding:18px;background:#fff;border:1px solid #E4E3DD;border-radius:12px;color:#6B7280;font-size:13px;">暂无运行记录（Cron 触发或 /run 后出现）。</div>`}`;
-  return htmlRes(pageShell("签到日志", inner));
+  return htmlRes(pageShell("Trae 签到日志", inner));
 }
 
 // ============================================================
