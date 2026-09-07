@@ -2,10 +2,11 @@
  * Trae Work 每日签到 —— Cloudflare Worker 单文件版（免 wrangler，控制台粘贴即用）
  * ------------------------------------------------------------------------
  * 入口：
- *   scheduled()  Cron 定时触发（控制台配置：每 6 小时一次，分钟=0、小时取 6 的倍数）
+ *   scheduled()  Cron 定时触发（控制台配置：每天一次，UTC 表达式见 README 对照表）
  *   fetch()      HTTP：/ 静态页(不执行任务) · /health · /logs · /log
- *                             /admin/login-url · /admin/callback · /admin/status · /admin/run
- * 存储：一个 KV Namespace，绑定名必须为 KV；一个密钥 ADMIN_TOKEN（/admin/* 用）
+ *                             /status · /run（公开，无需口令）
+ *                             /login-url · /callback（需请求头 X-Admin-Token）
+ * 存储：一个 KV Namespace，绑定名必须为 KV；一个密钥 ADMIN_TOKEN（仅 /login-url、/callback 用）
  * 对应 Python：trae_work_checkin.py（逻辑对齐：token 预刷新、status 免费先查、
  *   claim 单次、9074 退避状态写 KV 交下一个 Cron；云端不做进程内长睡眠）
  */
@@ -31,7 +32,9 @@ const LOG_TTL = 30 * 24 * 3600;             // 日志保留 30 天
 const LOG_LIST_LIMIT = 50;                  // /logs 列表条数
 
 const JSON_H = { "Content-Type": "application/json;charset=utf-8" };
-const HTML_H = { "Content-Type": "text/html;charset=utf-8" };
+const HTML_H = { "Content-Type": "text/html;charset=utf-8", "X-Content-Type-Options": "nosniff" };
+// 注意：Response 的头必须嵌在 init.headers 里；直接 new Response(html, HTML_H) 会被忽略并回退成 text/plain
+const htmlRes = (html) => new Response(html, { headers: HTML_H });
 
 // ============================================================
 // 基础工具
@@ -239,7 +242,7 @@ async function apiUsage(token, aha) {
 }
 
 // ============================================================
-// 录入凭证（/admin/callback）：解析回调 → 换 token → 落 KV
+// 录入凭证（/callback）：解析回调 → 换 token → 落 KV
 // ============================================================
 async function provision(env, body, logger) {
   const callbackUrl = body.callback_url || body.callbackUrl || "";
@@ -317,7 +320,7 @@ async function runAccount(env, acct, { trigger, force, logger }) {
     }
 
     const aha = String(cred.aha_device_id || "");
-    if (!/^\d{8,16}$/.test(aha)) throw new Error("缺少合法 aha_device_id，请重新走 /admin/callback 录入");
+    if (!/^\d{8,16}$/.test(aha)) throw new Error("缺少合法 aha_device_id，请重新走 /callback 录入");
 
     // —— 2) 限频三道闸门（手动 force 时绕过）——
     const guard = await loadGuard(kv, uid);
@@ -405,7 +408,7 @@ async function runAll(env, trigger, force) {
     } catch (e) {
       if (e instanceof AuthError) {
         summary.phase = "login_required";
-        summary.message = "登录态失效，需重新走 /admin/callback 录入";
+        summary.message = "登录态失效，需重新走 /callback 录入";
       } else {
         summary.phase = "error";
         summary.message = String((e && e.message) || e);
@@ -476,8 +479,8 @@ async function renderLogs(env, filterUid) {
         <th style="padding:8px 10px;font-weight:600;">时间(北京)</th><th style="padding:8px 10px;font-weight:600;">结果</th>
         <th style="padding:8px 10px;font-weight:600;">账号</th><th style="padding:8px 10px;font-weight:600;">说明</th><th></th>
       </tr></thead><tbody>${rows}</tbody></table>`
-      : `<div style="padding:18px;background:#fff;border:1px solid #E4E3DD;border-radius:12px;color:#6B7280;font-size:13px;">暂无运行记录（Cron 触发或 /admin/run 后出现）。</div>`}`;
-  return new Response(pageShell("签到日志", inner), HTML_H);
+      : `<div style="padding:18px;background:#fff;border:1px solid #E4E3DD;border-radius:12px;color:#6B7280;font-size:13px;">暂无运行记录（Cron 触发或 /run 后出现）。</div>`}`;
+  return htmlRes(pageShell("签到日志", inner));
 }
 
 // ============================================================
@@ -502,13 +505,14 @@ async function handleFetch(req, env) {
   if (path === "/" && method === "GET") {
     const inner = `
       <h2 style="font-size:18px;">Trae 签到 Worker</h2>
-      <p style="font-size:14px;color:#374151;">服务运行中。本页面<strong>不执行任何签到任务</strong>，任务只由 Cron 定时或带口令的 <code>/admin/run</code> 触发。</p>
+      <p style="font-size:14px;color:#374151;">服务运行中。本页面<strong>不执行任何签到任务</strong>，任务只由 Cron 定时或 POST <code>/run</code> 触发。</p>
       <p style="font-size:14px;">
-        <a href="/logs" style="color:#2E7E96;">查看运行日志 /logs</a>　·　
+        <a href="/logs" style="color:#2E7E96;">运行日志 /logs</a>　·　
+        <a href="/status" style="color:#2E7E96;">账号状态 /status</a>　·　
         <a href="/health" style="color:#2E7E96;">/health</a>
       </p>
-      <p style="font-size:12px;color:#6B7280;">管理接口 /admin/* 需请求头 X-Admin-Token。</p>`;
-    return new Response(pageShell("Trae 签到 Worker", inner), HTML_H);
+      <p style="font-size:12px;color:#6B7280;">仅录入凭证用的 /login-url、/callback 需要请求头 X-Admin-Token；/run、/status、/logs 均公开。</p>`;
+    return htmlRes(pageShell("Trae 签到 Worker", inner));
   }
 
   if (path === "/health" && method === "GET")
@@ -523,24 +527,46 @@ async function handleFetch(req, env) {
     const text = (await env.KV.get(id)) || "记录不存在或已过期";
     const inner = `<p><a href="/logs" style="color:#2E7E96;font-size:13px;text-decoration:none;">← 返回列表</a></p>
       <pre style="white-space:pre-wrap;word-break:break-all;background:#fff;border:1px solid #E4E3DD;border-radius:12px;padding:14px;font-size:12.5px;line-height:1.6;">${escapeHtml(text)}</pre>`;
-    return new Response(pageShell("日志详情", inner), HTML_H);
+    return htmlRes(pageShell("日志详情", inner));
   }
 
-  // —— 以下全部需要 X-Admin-Token ——
-  if (path.startsWith("/admin/")) {
+  // —— 公开：账号状态（不含任何 token）——
+  if (path === "/status" && method === "GET") {
+    const { keys } = await env.KV.list({ prefix: "acct:" });
+    const accounts = [];
+    for (const { name } of keys) {
+      const a = await getJSON(env.KV, name, null);
+      if (!a) continue;
+      const st = await getJSON(env.KV, stateKey(a.uid), {});
+      accounts.push({
+        uid: a.uid, nickname: a.nickname, aha_device_id: a.aha_device_id,
+        token_expires: fmtCST(a.expires_at), state: st, // 不含任何 access/refresh token
+      });
+    }
+    return new Response(JSON.stringify({ accounts }), { headers: JSON_H });
+  }
+
+  // —— 公开：手动触发（手动即强制，无参数）——
+  if (path === "/run" && method === "POST") {
+    const result = await runAll(env, "manual", true);
+    return new Response(JSON.stringify(result), { headers: JSON_H });
+  }
+
+  // —— 仅录入凭证的两个接口需要 X-Admin-Token ——
+  if (path === "/login-url" || path === "/callback") {
     const deny = requireAdmin(req, env);
     if (deny) return deny;
 
-    if (path === "/admin/login-url" && method === "GET") {
+    if (path === "/login-url" && method === "GET") {
       const machineId = randHex(16), deviceId = randHex(16);
       return new Response(JSON.stringify({
         login_url: buildLoginUrl(machineId, deviceId),
         machine_id: machineId, oauth_device_id: deviceId,
-        hint: "浏览器打开 login_url 登录，复制跳到 127.0.0.1 的完整地址，连同 aha_device_id POST 到 /admin/callback",
+        hint: "浏览器打开 login_url 登录，复制跳到 127.0.0.1 的完整地址，连同 aha_device_id POST 到 /callback（需 X-Admin-Token 头）",
       }), { headers: JSON_H });
     }
 
-    if (path === "/admin/callback" && method === "POST") {
+    if (path === "/callback" && method === "POST") {
       const logger = makeLogger();
       try {
         const result = await provision(env, await readJson(req), logger);
@@ -550,27 +576,7 @@ async function handleFetch(req, env) {
       }
     }
 
-    if (path === "/admin/status" && method === "GET") {
-      const { keys } = await env.KV.list({ prefix: "acct:" });
-      const accounts = [];
-      for (const { name } of keys) {
-        const a = await getJSON(env.KV, name, null);
-        if (!a) continue;
-        const st = await getJSON(env.KV, stateKey(a.uid), {});
-        accounts.push({
-          uid: a.uid, nickname: a.nickname, aha_device_id: a.aha_device_id,
-          token_expires: fmtCST(a.expires_at), state: st, // 不含任何 access/refresh token
-        });
-      }
-      return new Response(JSON.stringify({ accounts }), { headers: JSON_H });
-    }
-
-    if (path === "/admin/run" && method === "POST") { // 手动即强制，无参数
-      const result = await runAll(env, "manual", true);
-      return new Response(JSON.stringify(result), { headers: JSON_H });
-    }
-
-    return new Response(JSON.stringify({ error: "未知管理接口" }), { status: 404, headers: JSON_H });
+    return new Response(JSON.stringify({ error: "method not allowed" }), { status: 405, headers: JSON_H });
   }
 
   return new Response("Not Found", { status: 404 });
