@@ -491,7 +491,9 @@ function pageShell(title, inner, autoRefresh) {
     '<meta name="viewport" content="width=device-width,initial-scale=1">' +
     (autoRefresh ? '<meta http-equiv="refresh" content="60">' : "") +
     "<title>" + escapeHtml(title) + "</title><style>" + PAGE_CSS + "</style></head>" +
-    '<body><div class="wrap">' + inner + '</div></body></html>';
+    '<body><div class="wrap">' + inner +
+    '<footer style="text-align:center;margin-top:18px;font-size:12px;color:#8A919C;">Powered by <a href="https://github.com/chevy222/trae-cf-checkin" target="_blank" rel="noopener">Github</a></footer>' +
+    '</div></body></html>';
 }
 
 const PHASE_LABEL = {
