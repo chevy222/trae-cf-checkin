@@ -693,7 +693,7 @@ function requireAdmin(req, env) {
 }
 async function readJson(req) { try { return await req.json(); } catch { return {}; } }
 // 浏览器查看时渲染页面；非浏览器调用时返回 JSON
-function wantsHtml(url, req) {
+function wantsHtml(req) {
   return (req.headers.get("accept") || "").includes("text/html");
 }
 
@@ -704,7 +704,7 @@ async function handleFetch(req, env) {
 
   // —— 根路径：首页（账号 / 立即签到 / 运行日志 / 可用操作，绝不执行任务）——
   if (path === "/" && method === "GET") {
-    if (wantsHtml(url, req)) return renderHome(env);
+    if (wantsHtml(req)) return renderHome(env);
     return new Response(JSON.stringify({
       ok: true,
       report: "Trae 签到 Worker 运行中。路径：/run（立即签到）、/status（账号状态）、/logs（运行日志）；浏览器访问为可视化页面。录入/删除凭证的 /login-url、/callback、/remove 需请求头 X-Admin-Token。",
@@ -714,10 +714,11 @@ async function handleFetch(req, env) {
   // —— 公开：运行日志列表 / 账号状态 / 立即签到（均为 GET）——
   if (path === "/logs" && method === "GET") {
     const uid = url.searchParams.get("uid");
-    return wantsHtml(url, req) ? renderLogs(env, uid) : renderLogsJson(env, uid);
+    return wantsHtml(req) ? renderLogs(env, uid) : renderLogsJson(env, uid);
   }
 
   if (path === "/status" && method === "GET") {
+    if (wantsHtml(req)) return renderStatus(env);
     const { keys } = await env.KV.list({ prefix: "acct:" });
     const accounts = [];
     for (const { name } of keys) {
@@ -729,13 +730,12 @@ async function handleFetch(req, env) {
         token_expires: fmtCST(a.expires_at), state: st, // 不含任何 access/refresh token
       });
     }
-    if (wantsHtml(url, req)) return renderStatus(env);
     return new Response(JSON.stringify({ accounts }), { headers: JSON_H });
   }
 
   if (path === "/run" && method === "GET") {
     const result = await runAll(env, "manual"); // 与 Cron 一致：走完整闸门（限频暂停/间隔/每日上限）
-    if (wantsHtml(url, req)) return renderRunResult(result);
+    if (wantsHtml(req)) return renderRunResult(result);
     return new Response(JSON.stringify(result), { headers: JSON_H });
   }
   if (path === "/run" && method === "POST")
@@ -777,13 +777,13 @@ async function handleFetch(req, env) {
       await env.KV.delete(stateKey(uid));  // 最近运行快照
       let logsDeleted = 0;
       if (!body.keep_logs) {
-        // 按元数据 uid 匹配删除，兼容新旧两种键格式（log:uid:日期:ms 与 log:ms:uid）
+        // 按元数据 uid 匹配删除该账号的历史日志
         let cursor;
         for (let i = 0; i < 10; i++) {
           const page = await env.KV.list({ prefix: "log:", limit: 1000, cursor });
           for (const k of page.keys) {
             const m = k.metadata || {};
-            if (String(m.uid || "") === uid || k.name.startsWith(`log:${uid}:`)) {
+            if (String(m.uid || "") === uid) {
               await env.KV.delete(k.name);
               logsDeleted++;
             }
