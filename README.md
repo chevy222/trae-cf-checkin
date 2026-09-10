@@ -194,7 +194,7 @@ https://<worker名>.<你的子域>.workers.dev/logs
 ```
 https://<worker名>.<你的子域>.workers.dev/status
 ```
-返回每个账号的昵称、设备号、Token 到期时间、最近一次运行状态（**不会返回 Token 明文**）；命令行 `Invoke-RestMethod -Uri "$base/status"` 返回 JSON。
+返回每个账号的昵称、设备号、Token 到期时间、最近一次运行状态，以及**限频闸门**（今日 claim 次数 / 是否处于限频暂停 / 连续限频次数 / 距下次可领取还有多久）——本次被"跳过"时，看一眼闸门那行就知道卡在哪一档（**不会返回 Token 明文**）；命令行 `Invoke-RestMethod -Uri "$base/status"` 返回 JSON，闸门状态在 `guard` 字段里。
 
 ### 8.4 删除某个账号（多账号时用）
 先从 8.3 的结果里找到要删账号的 `uid`（一串数字），然后（需要口令）：
@@ -217,7 +217,7 @@ Invoke-RestMethod "$base/remove" -Method Post -Headers $h -ContentType "applicat
 | `/login-url` | GET | **是** | 生成 Trae 登录链接 |
 | `/callback` | POST | **是** | 录入凭证，JSON：`{"callback_url":"...","aha_device_id":"..."}` |
 | `/remove` | POST | **是** | 删除账号，JSON：`{"uid":"数字"}`，默认连日志一起删 |
-| `/status` | GET | 否 | 账号与 Token/签到状态（不含 Token 明文），浏览器=页面、程序调用=JSON |
+| `/status` | GET | 否 | 账号、Token 到期、最近运行与限频闸门状态（不含 Token 明文），浏览器=页面、程序调用=JSON |
 | `/run` | GET | 否 | 立即手动签到一次（逻辑与 Cron 一致，受限频闸门保护），浏览器打开即触发 |
 
 > 录入/删除凭证的 `/login-url`、`/callback`、`/remove` 需要鉴权头 `X-Admin-Token: <你的 ADMIN_TOKEN>`，用 PowerShell（或 Postman、Apifox）调用；`/run`、`/status`、`/logs` 浏览器直接打开即可（`/run` 打开就会真的跑一次签到）。
@@ -244,7 +244,7 @@ curl.exe -X POST -H "X-Admin-Token: 你的口令" -H "Content-Type: application/
 说明 refresh token 也过期了，无法静默续期。重做第 7 步（`login-url` → 登录 → `callback`）即可恢复，KV 里的旧凭证会被覆盖。
 
 **Q：我现在就想签到，不想等定时？**
-随时打开 `$base/run`（GET，无需口令）。与 Cron 一致，同样受"间隔/暂停/每日上限"闸门保护；若在上次领取后 30 分钟内，或正处于限频暂停期/已达当日上限，本次会返回"跳过"（phase 为 skipped），不会重复领。
+随时打开 `$base/run`（GET，无需口令）。与 Cron 一致，同样受"间隔/暂停/每日上限"闸门保护；若在上次领取后 30 分钟内，或正处于限频暂停期/已达当日上限，本次会返回"跳过"（phase 为 skipped），不会重复领。具体卡在哪一档，打开 `$base/status` 看每个账号的**闸门**那一行即可。
 
 **Q：日志时间是哪个时区？**
 页面和接口都按**北京时间（UTC+8）**显示。Cron 表达式本身是 UTC，对照见第四步。

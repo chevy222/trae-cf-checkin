@@ -13,6 +13,14 @@
  * 存储：一个 KV Namespace，绑定名必须为 KV；一个密钥 ADMIN_TOKEN（仅 /login-url、/callback、/remove 用）
  * 对应 Python：trae_work_checkin.py（逻辑对齐：token 预刷新、status 免费先查、
  *   claim 单次、9074 退避状态写 KV 交下一个 Cron；云端不做进程内长睡眠）
+ *
+ * 本轮加固（不影响接口，纯内部行为）：
+ *   1. claim 响应的 code 不再用 `|| 0` 兜底，避免空 body 被误判成「签到成功」
+ *   2. 「已签到」判定收窄为明确措辞，避免含“已”字的错误消息被当成成功
+ *   3. HTTP 429 纳入退避，与 9074 同等对待
+ *   4. 所有上游请求加 15s 超时；5xx 响应体写入日志前先做凭据脱敏
+ *   5. scheduled() 加兜底 try/catch，遍历前失败也会留一条日志
+ *   6. /status 页与 JSON 增加限频闸门状态；回调参数改为不经 '+' → 空格 转换的解析
  */
 
 // ============================================================
@@ -32,11 +40,23 @@ const MAX_DAILY_ATTEMPTS = 20;              // 每日 claim 上限
 const BACKOFF_PAUSE_MIN = [30, 60, 120, 240, 360]; // 9074 跨 Cron 退避档（分钟）
 
 const LOCK_TTL = 90;                        // 乐观锁 TTL（秒）
+const REQUEST_TIMEOUT_MS = 15000;           // 单次上游请求超时（毫秒），避免对端挂起拖死整个 Cron
 const LOG_TTL = 30 * 24 * 3600;             // 日志保留 30 天
 const LOG_LIST_LIMIT = 50;                  // /logs 列表条数
 
-const JSON_H = { "Content-Type": "application/json;charset=utf-8" };
-const HTML_H = { "Content-Type": "text/html;charset=utf-8", "X-Content-Type-Options": "nosniff" };
+const JSON_H = {
+  "Content-Type": "application/json;charset=utf-8",
+  "X-Content-Type-Options": "nosniff",
+  "Referrer-Policy": "no-referrer",
+};
+const HTML_H = {
+  "Content-Type": "text/html;charset=utf-8",
+  "X-Content-Type-Options": "nosniff",
+  "Referrer-Policy": "no-referrer",
+  "X-Frame-Options": "DENY",
+  // 页面无任何脚本 / 外链资源，只有内联样式，因此可以收得很死
+  "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+};
 // 注意：Response 的头必须嵌在 init.headers 里；直接 new Response(html, HTML_H) 会被忽略并回退成 text/plain
 const htmlRes = (html) => new Response(html, { headers: HTML_H });
 
@@ -74,11 +94,21 @@ function safeEqual(a, b) { // 恒定时间比较
   return diff === 0;
 }
 
+// 兜底脱敏：上游 5xx 的响应体可能回显请求内容，而错误信息最终会写进 KV 日志，这里先抹掉疑似凭据
+function redact(s) {
+  return String(s == null ? "" : s)
+    .replace(/eyJ[A-Za-z0-9_-]{10,}/g, "«jwt»")
+    .replace(/(["']?(?:access_token|refresh_token|token|authorization)["']?\s*[:=]\s*["']?)([^"',\s}]{6,})/gi, "$1«redacted»");
+}
+
 // 每次运行的内存日志（同时 console.log 供控制台实时日志），结束整体落一条 KV
 function makeLogger() {
   const lines = [];
+  const stringify = (v) => { // 循环引用 / BigInt 会让 JSON.stringify 抛异常，不能让日志拖垮主流程
+    try { return JSON.stringify(v); } catch { return String(v); }
+  };
   const push = (lvl, args) => {
-    const msg = args.map((v) => (typeof v === "object" ? JSON.stringify(v) : String(v))).join(" ");
+    const msg = args.map((v) => (v && typeof v === "object" ? stringify(v) : String(v))).join(" ");
     lines.push(`[${fmtCST(nowSec())}] [${lvl}] ${msg}`);
     console.log(lvl, msg);
   };
@@ -132,13 +162,14 @@ async function postJSON(url, body, headers = {}, retries = 3) {
         method: "POST",
         headers: { "Content-Type": "application/json", ...headers },
         body: JSON.stringify(body || {}),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS), // 无超时会让对端挂起拖死整个 Cron
       });
       const text = await resp.text();
       if (resp.ok) {
         try { return text ? JSON.parse(text) : {}; } catch { return {}; }
       }
       if (resp.status >= 400 && resp.status < 500) return { _http_error: resp.status, _body: text };
-      lastErr = new Error(`HTTP ${resp.status}: ${text.slice(0, 200)}`);
+      lastErr = new Error(`HTTP ${resp.status}${text ? `: ${redact(text).slice(0, 200)}` : ""}`);
     } catch (e) { lastErr = e; }
     if (i < retries) await sleep(1000 * (i + 1));
   }
@@ -170,9 +201,17 @@ function parseJsonParam(raw) {
   }
   return {};
 }
+// 从原始查询串取参数：只做一次 %XX 解码，不做 x-www-form-urlencoded 的 '+' → 空格转换。
+// searchParams.get() 会把字面量 '+' 解成空格，refreshToken / userJwt 里若含 '+' 会被悄悄破坏。
+function rawParam(rawQuery, name) {
+  const m = rawQuery.match(new RegExp(`(?:^|&)${name}=([^&]*)`));
+  if (!m) return "";
+  try { return decodeURIComponent(m[1]); } catch { return m[1]; }
+}
 function parseCallbackUrl(callbackUrl) {
   const u = new URL(callbackUrl);
-  const q = (n) => u.searchParams.get(n) || "";
+  const rawQuery = (u.search || u.hash || "").replace(/^[?#]/, "");
+  const q = (n) => rawParam(rawQuery, n);
   const userInfo = parseJsonParam(q("userInfo"));
   const userJwt = parseJsonParam(q("userJwt"));
   const refreshToken = q("refreshToken") || userJwt.RefreshToken || "";
@@ -365,11 +404,24 @@ async function runAccount(env, acct, { trigger, logger }) {
       await setJSON(kv, guardKey(uid), guard); // 先落 attempt 计数，再按登录失效上抛
       throw new AuthError(`领取接口返回 HTTP ${result._http_error}，登录态已失效，需重新走 /callback 录入`);
     }
-    if (result._http_error) result = { code: result._http_error, message: `HTTP ${result._http_error}` };
+    if (result._http_error) result = {
+      code: result._http_error,
+      // 429 是标准限频码，给个可读消息，后面会走退避分支
+      message: result._http_error === 429 ? "HTTP 429 请求过于频繁" : `HTTP ${result._http_error}`,
+    };
 
-    const code = result.code || 0;
+    // 注意：不能写 result.code || 0。上游 HTTP 200 但 body 为空时 postJSON 返回 {}，
+    // undefined 会被折成 0，从而被下面的 code === 0 误判为「签到成功」，还顺手清掉限频暂停状态。
+    const hasCode = result.code !== undefined && result.code !== null;
+    const code = hasCode ? Number(result.code) : null;
     const msg = result.message || "";
     const low = msg.toLowerCase();
+
+    if (!hasCode && !msg) { // 既无 code 也无 message：响应结构不可识别，按失败处理并留证
+      await setJSON(kv, guardKey(uid), guard); // 保留本次 attempt 计数，留给下一周期
+      logger.warn("签到响应结构异常，原始返回：", JSON.stringify(result).slice(0, 300));
+      return { ok: false, phase: "error", code: null, message: "签到响应结构异常（未返回 code/message），已按失败处理" };
+    }
 
     if (code === 0 || low.includes("success")) {
       guard.consecutive_rate_limits = 0; guard.paused_until = null;
@@ -395,13 +447,15 @@ async function runAccount(env, acct, { trigger, logger }) {
       const usage = await apiUsage(cred.access_token, aha).catch(() => null);
       return { ok: true, phase: "claimed", message, credits: gained, usage };
     }
-    if (low.includes("already") || msg.includes("已")) {
+    // 只用「已签到 / 已领取」等明确措辞：原来的 msg.includes("已") 会把
+    // “请求已过期”“账号已在其他设备登录”之类错误也判成已签到并返回 ok:true
+    if (low.includes("already") || /已(签到|领取|领过|签过)/.test(msg)) {
       guard.consecutive_rate_limits = 0; guard.paused_until = null;
       await setJSON(kv, guardKey(uid), guard);
       logger.info("今日已领取：", msg);
       return { ok: true, phase: "already", message: msg, checked_in: true };
     }
-    if (code === 9074 || msg.includes("频繁") || msg.includes("太多") || low.includes("too frequent")) {
+    if (code === 9074 || code === 429 || msg.includes("频繁") || msg.includes("太多") || low.includes("too frequent")) {
       const n = (guard.consecutive_rate_limits || 0) + 1;
       guard.consecutive_rate_limits = n;
       const pauseMin = BACKOFF_PAUSE_MIN[Math.min(n - 1, BACKOFF_PAUSE_MIN.length - 1)];
@@ -579,6 +633,7 @@ async function renderStatus(env) {
     if (!a || !a.uid) continue;
     any = true;
     const st = await getJSON(env.KV, stateKey(a.uid), {});
+    const guard = await loadGuard(env.KV, a.uid);
     const nm = a.nickname || (a.uid ? "UID " + String(a.uid).slice(-4) : "未命名");
     const left = Math.floor(((a.expires_at || 0) - nowSec()) / 86400);
     const expireMiddle = !a.expires_at ? "-"
@@ -590,10 +645,20 @@ async function renderStatus(env) {
       "Token 到期：" + expireMiddle + expireTail,
       "上次运行：" + (st.last_run_at ? fmtCST(st.last_run_at) + " · " + (st.trigger || "") : "暂无"),
     ];
+    // 限频闸门状态：把「为什么这次是 skipped」直接摊开，不用去猜
+    const now = nowSec();
+    const gate = [`今日 claim ${guard.daily_attempts || 0}/${MAX_DAILY_ATTEMPTS} 次`];
+    if (guard.paused_until && now < guard.paused_until) gate.push(`限频暂停至 ${fmtCST(guard.paused_until)}`);
+    if (guard.consecutive_rate_limits) gate.push(`连续限频 ${guard.consecutive_rate_limits} 次`);
+    if (guard.last_attempt) {
+      const wait = MIN_CLAIM_INTERVAL_SEC - (now - guard.last_attempt);
+      gate.push(wait > 0 ? `距可领取还有 ${Math.ceil(wait / 60)} 分钟` : `上次领取尝试 ${fmtCST(guard.last_attempt)}`);
+    }
     cards.push(`<div class="card"><div class="cardhd"><span class="accname">${escapeHtml(nm)}</span>${badge(st.phase)}</div>` +
       `<div class="report">${escapeHtml(st.message || (st.ok ? "状态正常" : "尚未运行"))}</div>` +
-      `<div class="meta">${meta.map(escapeHtml).join(" · ")}</div>` +
-      `<details><summary>查看原始 JSON</summary><pre>${escapeHtml(JSON.stringify({ account: { uid: a.uid, nickname: a.nickname, aha_device_id: a.aha_device_id, token_expires_at: fmtCST(a.expires_at) }, state: st }, null, 2))}</pre></details></div>`);
+      `<div class="meta">${meta.map((s) => escapeHtml(s)).join(" · ")}</div>` +
+      `<div class="meta">闸门：${gate.map((s) => escapeHtml(s)).join(" · ")}</div>` +
+      `<details><summary>查看原始 JSON</summary><pre>${escapeHtml(JSON.stringify({ account: { uid: a.uid, nickname: a.nickname, aha_device_id: a.aha_device_id, token_expires_at: fmtCST(a.expires_at) }, guard, state: st }, null, 2))}</pre></details></div>`);
   }
   const body = any
     ? cards.join("")
@@ -615,7 +680,7 @@ function renderRunResult(result) {
     if (s.usage && s.usage.remaining != null) meta.push("剩余 " + s.usage.remaining + " 积分额度");
     return '<div class="card"><div class="cardhd"><span class="accname">' + escapeHtml(nm) + "</span>" + badge(s.phase) + "</div>" +
       '<div class="report">' + escapeHtml(s.message || "-") + "</div>" +
-      (meta.length ? '<div class="meta">' + meta.map(escapeHtml).join(" · ") + "</div>" : "") +
+      (meta.length ? '<div class="meta">' + meta.map((s) => escapeHtml(s)).join(" · ") + "</div>" : "") +
       "</div>";
   }).join("");
   const inner =
@@ -725,9 +790,10 @@ async function handleFetch(req, env) {
       const a = await getJSON(env.KV, name, null);
       if (!a) continue;
       const st = await getJSON(env.KV, stateKey(a.uid), {});
+      const guard = await loadGuard(env.KV, a.uid);
       accounts.push({
         uid: a.uid, nickname: a.nickname, aha_device_id: a.aha_device_id,
-        token_expires: fmtCST(a.expires_at), state: st, // 不含任何 access/refresh token
+        token_expires: fmtCST(a.expires_at), state: st, guard, // 不含任何 access/refresh token
       });
     }
     return new Response(JSON.stringify({ accounts }), { headers: JSON_H });
@@ -822,6 +888,22 @@ export default {
     }
   },
   async scheduled(_controller, env) { // Cron：走完整闸门
-    await runAll(env, "cron");
+    try {
+      await runAll(env, "cron");
+    } catch (e) {
+      // 兜底：runAll 在账号遍历前失败（如 kv.list 抛错）时，每个账号的 try/catch 都没机会执行，
+      // state 和 log 都不会写，/logs 上会「什么都看不到」。这里补一条降级日志留证。
+      const msg = String((e && e.message) || e);
+      console.error("cron runAll 失败：", msg);
+      try {
+        const ts = nowSec(), tsMs = Date.now();
+        await env.KV.put(`log:${tsMs}:cron`,
+          `# CRON  ${fmtCST(ts)} (cron)\n结果：error  ${msg}\n\n[FATAL] 账号遍历前失败：${msg}\n`,
+          {
+            expirationTtl: LOG_TTL,
+            metadata: { ts, uid: "", nick: "CRON", ok: false, phase: "error", msg: msg.slice(0, 80) },
+          });
+      } catch {}
+    }
   },
 };
