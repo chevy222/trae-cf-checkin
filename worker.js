@@ -11,8 +11,8 @@
  *     /login-url、/callback、/remove   仅需请求头 X-Admin-Token
  *   （已移除 /health 与 /log?id= 接口）
  * 存储：一个 KV Namespace，绑定名必须为 KV；一个密钥 ADMIN_TOKEN（仅 /login-url、/callback、/remove 用）
- * 对应 Python：trae_work_checkin.py（逻辑对齐：token 预刷新、status 免费先查、
- *   claim 单次、9074 退避状态写 KV 交下一个 Cron；云端不做进程内长睡眠）
+ * 逻辑要点：token 预刷新、status 免费先查、claim 单次、
+ *   9074 退避状态写 KV 交下一个 Cron；云端不做进程内长睡眠
  *
  * 本轮加固（不影响接口，纯内部行为）：
  *   1. claim 响应的 code 不再用 `|| 0` 兜底，避免空 body 被误判成「签到成功」
@@ -220,7 +220,6 @@ function parseCallbackUrl(callbackUrl) {
     jwt_token: String(userJwt.Token || ""),
     uid: String(userInfo.UserID || ""),
     nickname: String(userInfo.ScreenName || ""),
-    ent_id: String(userInfo.TenantID || ""),
     raw_jwt: q("userJwt"),
   };
 }
@@ -255,7 +254,7 @@ async function getUserInfo(accessToken) {
       { "x-cloudide-token": accessToken, "User-Agent": `Trae/${APP_VERSION}` },
     );
     const r = resp.Result || resp;
-    return { uid: String(r.UserID || ""), nickname: String(r.ScreenName || ""), enterprise_id: String(r.EnterpriseID || "") };
+    return { uid: String(r.UserID || ""), nickname: String(r.ScreenName || "") };
   } catch { return {}; }
 }
 
@@ -300,11 +299,9 @@ async function provision(env, body, logger) {
     accessToken = tok.access_token; refreshToken = tok.refresh_token; expiresAt = tok.expires_at;
   } else if (parsed.jwt_token) { // 兜底：无 refreshToken，直接用 userJwt.Token
     accessToken = parsed.jwt_token; refreshToken = ""; expiresAt = 0;
-    try {
-      const j = parseJsonParam(parsed.raw_jwt);
-      expiresAt = parseInt(j.TokenExpireAt || 0, 10) || 0;
-      if (expiresAt > 1e12) expiresAt = Math.floor(expiresAt / 1000);
-    } catch {}
+    const j = parseJsonParam(parsed.raw_jwt); // 内部已吞异常，无需再包 try/catch
+    expiresAt = parseInt(j.TokenExpireAt || 0, 10) || 0;
+    if (expiresAt > 1e12) expiresAt = Math.floor(expiresAt / 1000);
     if (!expiresAt) expiresAt = nowSec() + 1209600;
   } else throw new Error("回调中没有 refreshToken 或 Token");
 
@@ -321,8 +318,7 @@ async function provision(env, body, logger) {
     aha_device_id: aha,
     created_at: now, updated_at: now,
   };
-  await setJSON(env.KV, acctKey(uid), acct);
-  if (!(await env.KV.get(guardKey(uid)))) await setJSON(env.KV, guardKey(uid), await loadGuard(env.KV, uid));
+  await setJSON(env.KV, acctKey(uid), acct); // guard 键无需预写：loadGuard 自带默认值与跨天重置，首次运行时自动落盘
   logger.info("凭证已录入 UID", uid, "昵称", acct.nickname, "Aha", aha, "有效期至", fmtCST(expiresAt));
   return { uid, nickname: acct.nickname, aha_device_id: aha, expires_at: expiresAt, expires_at_str: fmtCST(expiresAt) };
 }
@@ -680,7 +676,7 @@ function renderRunResult(result) {
     if (s.usage && s.usage.remaining != null) meta.push("剩余 " + s.usage.remaining + " 积分额度");
     return '<div class="card"><div class="cardhd"><span class="accname">' + escapeHtml(nm) + "</span>" + badge(s.phase) + "</div>" +
       '<div class="report">' + escapeHtml(s.message || "-") + "</div>" +
-      (meta.length ? '<div class="meta">' + meta.map((s) => escapeHtml(s)).join(" · ") + "</div>" : "") +
+      (meta.length ? '<div class="meta">' + meta.map((m) => escapeHtml(m)).join(" · ") + "</div>" : "") +
       "</div>";
   }).join("");
   const inner =
@@ -748,7 +744,7 @@ function requireAdmin(req, env) {
     return new Response(JSON.stringify({ error: "服务端未配置 ADMIN_TOKEN 密钥" }), { status: 500, headers: JSON_H });
   const got = req.headers.get("X-Admin-Token") || "";
   if (!safeEqual(got, env.ADMIN_TOKEN)) {
-    if ((req.headers.get("accept") || "").includes("text/html"))
+    if (wantsHtml(req))
       return new Response(pageShell("未授权",
         '<div class="card warn" style="color:#B03A3C;">此接口需要管理员口令：请用 PowerShell / curl 携带请求头 <code>X-Admin-Token</code> 调用（用法见 README）。</div>', false),
         { status: 401, headers: HTML_H });
@@ -864,7 +860,7 @@ async function handleFetch(req, env) {
     return new Response(JSON.stringify({ error: "method not allowed" }), { status: 405, headers: JSON_H });
   }
 
-  if ((req.headers.get("accept") || "").includes("text/html"))
+  if (wantsHtml(req))
     return new Response(pageShell("Not Found",
       '<div class="card">页面不存在。返回 <a href="/">首页</a>，可用路径：/run、/status、/logs。</div>', false),
       { status: 404, headers: HTML_H });
