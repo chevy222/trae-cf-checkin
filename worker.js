@@ -534,6 +534,17 @@ pre{white-space:pre-wrap;word-break:break-all;background:#fff;border:1px solid #
 details{margin-top:8px;} summary{cursor:pointer;color:#6B7280;font-size:12.5px;}
 .btnrow a{display:inline-block;padding:6px 14px;border:1px solid #CFDADF;background:#fff;border-radius:999px;font-size:13px;margin:0 8px 8px 0;}
 .warn{border-color:rgba(234,102,104,.45);}
+/* 移动端：日志表格转卡片布局（<640px 时每行一张卡，td 前置列名标签） */
+@media (max-width:640px){
+  .tbl-scroll{overflow-x:visible;}
+  .logtbl{display:block;border:none;background:transparent;}
+  .logtbl thead{display:none;}
+  .logtbl tbody{display:block;}
+  .logtbl tr{display:block;background:#fff;border:1px solid #E4E3DD;border-radius:12px;margin:10px 0;}
+  .logtbl td{display:block;border-top:none;padding:5px 14px;}
+  .logtbl td + td{border-top:1px dashed #F0EFEA;}
+  .logtbl td[data-label]::before{content:attr(data-label);display:inline-block;min-width:4.5em;color:#6B7280;font-size:12px;}
+}
 `;
 
 function pageShell(title, inner, autoRefresh) {
@@ -713,26 +724,25 @@ async function renderLogs(env, filterUid) {
     const m = k.m;
     const body = (await env.KV.get(k.name)) || "";
     rowHtml.push(`<tr>
-      <td style="padding:8px 10px;white-space:nowrap;color:#6B7280;font-size:12px;">${escapeHtml(fmtCST(m.ts))}</td>
-      <td style="padding:8px 10px;">${badge(m.phase)}</td>
-      <td style="padding:8px 10px;font-size:13px;">${escapeHtml(m.nick || (m.uid ? "UID " + String(m.uid).slice(-4) : "-"))}</td>
-      <td style="padding:8px 10px;font-size:13px;color:#374151;">${escapeHtml(m.msg || "")}</td>
+      <td data-label="时间(北京)" style="padding:8px 10px;white-space:nowrap;color:#6B7280;font-size:12px;">${escapeHtml(fmtCST(m.ts))}</td>
+      <td data-label="结果" style="padding:8px 10px;">${badge(m.phase)}</td>
+      <td data-label="账号" style="padding:8px 10px;font-size:13px;">${escapeHtml(m.nick || (m.uid ? "UID " + String(m.uid).slice(-4) : "-"))}</td>
+      <td data-label="说明" style="padding:8px 10px;font-size:13px;color:#374151;">${escapeHtml(m.msg || "")}</td>
       <td style="padding:8px 10px;"><details><summary style="color:#2E7E96;font-size:12px;cursor:pointer;">详情</summary>
         <pre style="margin-top:6px;max-height:320px;overflow:auto;">${escapeHtml(body)}</pre></details></td>
     </tr>`);
   }
-  const rows = rowHtml.join("");
+  // 无数据时也渲染表格与表头（与 WorkBuddy 版一致），tbody 放一条跨列提示
+  const rows = rowHtml.join("") ||
+    `<tr><td colspan="5" class="sub" style="padding:18px 10px;">暂无运行记录，点上方「立即签到」执行一次后即可看到。</td></tr>`;
   const inner = `
     <div class="hd"><h2>Trae 签到运行日志</h2>
     <span class="sub">最近 ${LOG_LIST_LIMIT} 条 · 每 60 秒自动刷新 · 仅保留 30 天</span></div>
     ${toolbar()}
     <hr>
-    ${rows ? `<div class="tbl-scroll"><table>
-      <thead><tr style="text-align:left;background:rgba(163,213,232,.18);font-size:12px;color:#374151;">
-        <th style="padding:8px 10px;font-weight:600;">时间(北京)</th><th style="padding:8px 10px;font-weight:600;">结果</th>
-        <th style="padding:8px 10px;font-weight:600;">账号</th><th style="padding:8px 10px;font-weight:600;">说明</th><th></th>
-      </tr></thead><tbody>${rows}</tbody></table></div>`
-      : `<div class="card sub">暂无运行记录（Cron 定时触发或访问 <code>/run</code> 后出现）。</div>`}`;
+    <div class="tbl-scroll"><table class="logtbl">
+      <thead><tr><th>时间(北京)</th><th>结果</th><th>账号</th><th>说明</th><th></th></tr></thead>
+      <tbody>${rows}</tbody></table></div>`;
   return htmlRes(pageShell("Trae 签到日志", inner, true));
 }
 
