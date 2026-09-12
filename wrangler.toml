@@ -1,0 +1,11 @@
+name = "trae"
+main = "worker.js"
+compatibility_date = "2026-09-12"
+keep_vars = true
+
+[triggers]
+crons = ["0 0 * * *"]
+
+[[kv_namespaces]]
+binding = "KV"
+id = "ff01192dcf8641e5b28a0cf366aa439b"
