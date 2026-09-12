@@ -34,7 +34,7 @@
 // 当天第几个改动就写几；跨天则换成当天日期、序号从 1 重新开始。
 // 页脚会显示它——配合自动部署时，刷新页面看这一行变没变，就知道新版本上线没有。
 // ============================================================
-const BUILD_VERSION = "20260912:2";
+const BUILD_VERSION = "20260912:3";
 
 // ============================================================
 // 常量（对齐 Python）
@@ -55,18 +55,21 @@ const BACKOFF_PAUSE_MIN = [30, 60, 120, 240, 360]; // 9074 跨 Cron 退避档（
 const LOCK_TTL = 90;                        // 乐观锁 TTL（秒）
 const REQUEST_TIMEOUT_MS = 15000;           // 单次上游请求超时（毫秒），避免对端挂起拖死整个 Cron
 const LOG_TTL = 30 * 24 * 3600;             // 日志保留 30 天
-const LOG_LIST_LIMIT = 50;                  // /logs 列表条数
+const LOG_LIST_LIMIT = 30;                  // /logs 列表条数（/logs 每 60 秒自动刷新，条数直接决定每次刷新读多少次 KV）
 
 const JSON_H = {
   "Content-Type": "application/json;charset=utf-8",
   "X-Content-Type-Options": "nosniff",
   "Referrer-Policy": "no-referrer",
+  // 这些接口返回的都是实时状态，缓存住会让人误判（如刷新页面看不到最新 version / 日志）
+  "Cache-Control": "no-store",
 };
 const HTML_H = {
   "Content-Type": "text/html;charset=utf-8",
   "X-Content-Type-Options": "nosniff",
   "Referrer-Policy": "no-referrer",
   "X-Frame-Options": "DENY",
+  "Cache-Control": "no-store",
   // 页面无任何脚本 / 外链资源，只有内联样式，因此可以收得很死
   "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
 };
@@ -159,7 +162,11 @@ async function loadGuard(kv, uid) {
   const today = cstDay(nowSec());
   const def = { date: today, last_attempt: null, daily_attempts: 0, consecutive_rate_limits: 0, paused_until: null };
   const g = await getJSON(kv, guardKey(uid), null);
-  const merged = g ? { ...def, ...g } : def;
+  // 只挑已知字段，不用 { ...def, ...g } 整体合并：早期版本写过 last_success，
+  // 现在已不再维护，整体合并会把它一并带出来、显示在 /status 上，
+  // 看起来像"最近一次成功时间"，实则早已冻结，会误导判断。
+  const merged = { ...def };
+  if (g) for (const k of Object.keys(def)) if (g[k] !== undefined) merged[k] = g[k];
   if (merged.date !== today) { // 跨天重置
     merged.date = today; merged.daily_attempts = 0;
     merged.consecutive_rate_limits = 0; merged.paused_until = null;
@@ -685,11 +692,13 @@ async function renderStatus(env) {
     const expireMiddle = !a.expires_at ? "-"
       : (left < 0 ? `<span style="color:#B03A3C;">已过期</span>` : "剩 " + left + " 天");
     const expireTail = a.expires_at ? " · " + fmtCST(a.expires_at) : "";
+    // 逐字段转义后拼接（不要先拼好 HTML 再整体 escapeHtml——那样会把上面的 <span> 转成字面文本）。
+    // expireMiddle / expireTail 之外的片段都可能含 KV 里的数据，这里统一 escapeHtml 兜住。
     const meta = [
-      "UID " + String(a.uid).replace(/(\d{4})\d+(\d{4})/, "$1••••$2"),
-      "设备号 " + String(a.aha_device_id || "-").replace(/(\d{4})\d+(\d{4})/, "$1••••••••$2"),
-      "Token 到期：" + expireMiddle + expireTail,
-      "上次运行：" + (st.last_run_at ? fmtCST(st.last_run_at) + " · " + triggerLabel(st.trigger) : "暂无"),
+      escapeHtml("UID " + String(a.uid).replace(/(\d{4})\d+(\d{4})/, "$1••••$2")),
+      escapeHtml("设备号 " + String(a.aha_device_id || "-").replace(/(\d{4})\d+(\d{4})/, "$1••••••••$2")),
+      "Token 到期：" + expireMiddle + escapeHtml(expireTail),
+      escapeHtml("上次运行：" + (st.last_run_at ? fmtCST(st.last_run_at) + " · " + triggerLabel(st.trigger) : "暂无")),
     ];
     // 限频闸门状态：把「为什么这次是 skipped」直接摊开，不用去猜
     const now = nowSec();
@@ -702,7 +711,7 @@ async function renderStatus(env) {
     }
     cards.push(`<div class="card"><div class="cardhd"><span class="accname">${escapeHtml(nm)}</span>${badge(st.phase)}</div>` +
       `<div class="report">${escapeHtml(st.message || (st.ok ? "状态正常" : "尚未运行"))}</div>` +
-      `<div class="meta">${meta.map((s) => escapeHtml(s)).join(" · ")}</div>` +
+      `<div class="meta">${meta.join(" · ")}</div>` + // meta 内各字段已在构造时逐项转义
       `<div class="meta">闸门：${gate.map((s) => escapeHtml(s)).join(" · ")}</div>` +
       `<details><summary>查看原始 JSON</summary><pre>${escapeHtml(JSON.stringify({ account: { uid: a.uid, nickname: a.nickname, aha_device_id: a.aha_device_id, token_expires_at: fmtCST(a.expires_at) }, guard, state: st }, null, 2))}</pre></details></div>`);
   }
@@ -714,7 +723,9 @@ async function renderStatus(env) {
     '<div class="hd"><h2>Trae 账号状态</h2><span class="sub">Token 到期 / 最近运行 · 不显示 Token 明文</span></div>' +
     toolbar() + cronBlock + body +
     '<p class="sub" style="margin-top:8px;">本页不含任何 Token；程序调用时返回 JSON。</p>';
-  return htmlRes(pageShell("Trae 账号状态", inner, true));
+  // 不自动刷新：该页一次要读 list + 每账号 3 次 KV，60 秒一轮会持续消耗免费额度
+  // （KV 免费版 list 仅 1000 次/天）。要刷新手动按 F5 即可。
+  return htmlRes(pageShell("Trae 账号状态", inner, false));
 }
 
 /* —— /run：手动签到结果页 —— */
