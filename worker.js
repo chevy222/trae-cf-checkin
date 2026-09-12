@@ -21,6 +21,12 @@
  *   4. 所有上游请求加 15s 超时；5xx 响应体写入日志前先做凭据脱敏
  *   5. scheduled() 加兜底 try/catch，遍历前失败也会留一条日志
  *   6. /status 页与 JSON 增加限频闸门状态；回调参数改为不经 '+' → 空格 转换的解析
+ *   7. scheduled() 入口补一行 console.log（实时日志不依赖 KV），并在 0 账号时也写一条日志，
+ *      使「触发器没被调用」与「调用了但没配账号」在实时日志 / /logs 上可区分
+ *   8. scheduled() 入口落一条 cron 心跳到 KV（cron:last，含 Cloudflare 实际使用的表达式与计划时间），
+ *      并在 /status 上展示——「定时任务到底有没有来过」从此可持久查询，不必依赖当时是否有人看实时日志
+ *   9. /logs 标注执行来源（定时触发 / 手动 · /run）：新日志写进 metadata.trigger，
+ *      历史日志从正文首行的 (cron)/(manual) 兜底解析，页面与 JSON 都带上
  */
 
 // ============================================================
@@ -128,6 +134,9 @@ const acctKey = (uid) => `acct:${uid}`;
 const guardKey = (uid) => `guard:${uid}`;
 const stateKey = (uid) => `state:${uid}`;
 const lockKey = (uid) => `lock:${uid}`;
+// Cron 心跳：只由 scheduled() 写、与账号无关。key 前缀不是 acct:，不会被 runAll 当成账号遍历到。
+// 用途：证明「定时任务真的被调度到过」，并把 Cloudflare 实际使用的表达式记下来供核对。
+const CRON_KEY = "cron:last";
 
 async function getJSON(kv, key, def) {
   try {
@@ -498,7 +507,7 @@ async function runAll(env, trigger) {
         `结果：${summary.phase}  ${summary.message}\n\n${logger.text()}\n`;
       await kv.put(logName, body, {
         expirationTtl: LOG_TTL,
-        metadata: { ts, uid: acct.uid, nick: acct.nickname || "", ok: !!summary.ok, phase: summary.phase, msg: String(summary.message || "").slice(0, 80) },
+        metadata: { ts, uid: acct.uid, nick: acct.nickname || "", ok: !!summary.ok, phase: summary.phase, trigger, msg: String(summary.message || "").slice(0, 80) },
       });
       out.push(summary);
     }
@@ -570,6 +579,15 @@ function badge(phase) {
   return `<span class="badge" style="color:${color};background:${bg};">${escapeHtml(label)}</span>`;
 }
 
+// 执行来源的中文标签（与 workbuddy 版同款）：cron=定时触发，manual=手动访问 /run
+function triggerLabel(t) {
+  if (!t) return "-";
+  if (t === "cron") return "定时触发";
+  if (t === "manual") return "手动 · /run";
+  if (t.indexOf("http:") === 0) return "手动 · " + t.slice(5); // 兼容 workbuddy 风格的取值
+  return String(t);
+}
+
 // 工具条：首页 / 立即签到 / 运行日志 / 账号状态
 function toolbar() {
   return `<div class="btnrow" style="margin-top:4px;">` +
@@ -633,6 +651,7 @@ async function renderHome(env) {
 /* —— /status：账号与 Token 状态页 —— */
 async function renderStatus(env) {
   const { keys } = await env.KV.list({ prefix: "acct:" });
+  const hb = await getJSON(env.KV, CRON_KEY, null);
   const cards = [];
   let any = false;
   for (const { name } of keys) {
@@ -650,7 +669,7 @@ async function renderStatus(env) {
       "UID " + String(a.uid).replace(/(\d{4})\d+(\d{4})/, "$1••••$2"),
       "设备号 " + String(a.aha_device_id || "-").replace(/(\d{4})\d+(\d{4})/, "$1••••••••$2"),
       "Token 到期：" + expireMiddle + expireTail,
-      "上次运行：" + (st.last_run_at ? fmtCST(st.last_run_at) + " · " + (st.trigger || "") : "暂无"),
+      "上次运行：" + (st.last_run_at ? fmtCST(st.last_run_at) + " · " + triggerLabel(st.trigger) : "暂无"),
     ];
     // 限频闸门状态：把「为什么这次是 skipped」直接摊开，不用去猜
     const now = nowSec();
@@ -670,9 +689,17 @@ async function renderStatus(env) {
   const body = any
     ? cards.join("")
     : '<div class="card">尚未录入任何账号。通过 <code>/login-url</code> + <code>/callback</code>（需 <code>X-Admin-Token</code>）录入后此页会展示账号与 Token 状态。</div>';
+  // 定时任务心跳卡：一眼看出「cron 到底有没有来过」，不依赖账号是否配置、也不依赖当时是否在看实时日志
+  const cronBlock = hb
+    ? `<div class="card"><div class="accname">定时任务（Cron）</div>` +
+      `<div class="report" style="color:#2F6B12;">上次触发：${escapeHtml(fmtCST(hb.ts))}</div>` +
+      `<div class="meta">Cloudflare 使用的表达式：<code>${escapeHtml(hb.cron || "未提供")}</code> · 计划时间 ${escapeHtml(hb.plan_at_str || "-")}</div></div>`
+    : `<div class="card warn"><div class="accname">定时任务（Cron）</div>` +
+      `<div class="report" style="color:#B03A3C;">尚无触发记录</div>` +
+      `<div class="meta">若面板上已配置 Cron 触发器、此卡却长期为空，说明定时任务没有被调度到（代码侧无法影响调度，需查触发器配置与域名绑定的 Worker）。</div></div>`;
   const inner =
     '<div class="hd"><h2>Trae 账号状态</h2><span class="sub">Token 到期 / 最近运行 · 不显示 Token 明文</span></div>' +
-    toolbar() + body +
+    toolbar() + cronBlock + body +
     '<p class="sub" style="margin-top:8px;">本页不含任何 Token；程序调用时返回 JSON。</p>';
   return htmlRes(pageShell("Trae 账号状态", inner, true));
 }
@@ -723,8 +750,10 @@ async function renderLogs(env, filterUid) {
   for (const k of entries) {
     const m = k.m;
     const body = (await env.KV.get(k.name)) || "";
+    // 执行来源：新日志读 metadata.trigger；历史日志（该字段是后加的）从正文首行的 (cron)/(manual) 兜底解析
+    const trigger = m.trigger || (body.match(/\((cron|manual)\)/) || [])[1] || "";
     rowHtml.push(`<tr>
-      <td data-label="时间(北京)" style="padding:8px 10px;white-space:nowrap;color:#6B7280;font-size:12px;">${escapeHtml(fmtCST(m.ts))}</td>
+      <td data-label="时间(北京)" style="padding:8px 10px;white-space:nowrap;color:#6B7280;font-size:12px;">${escapeHtml(fmtCST(m.ts))}<br><span style="color:#8A919C;">${escapeHtml(triggerLabel(trigger))}</span></td>
       <td data-label="结果" style="padding:8px 10px;">${badge(m.phase)}</td>
       <td data-label="账号" style="padding:8px 10px;font-size:13px;">${escapeHtml(m.nick || (m.uid ? "UID " + String(m.uid).slice(-4) : "-"))}</td>
       <td data-label="说明" style="padding:8px 10px;font-size:13px;color:#374151;">${escapeHtml(m.msg || "")}</td>
@@ -802,7 +831,7 @@ async function handleFetch(req, env) {
         token_expires: fmtCST(a.expires_at), state: st, guard, // 不含任何 access/refresh token
       });
     }
-    return new Response(JSON.stringify({ accounts }), { headers: JSON_H });
+    return new Response(JSON.stringify({ accounts, cron_last: await getJSON(env.KV, CRON_KEY, null) }), { headers: JSON_H });
   }
 
   if (path === "/run" && method === "GET") {
@@ -881,7 +910,9 @@ async function handleFetch(req, env) {
 async function renderLogsJson(env, filterUid) {
   const mask = (v) => String(v || "").replace(/(\d{4})\d+(\d{4})/, "$1••••$2");
   const logs = (await listLogEntries(env.KV, filterUid)).map((k) => ({
-    ts: k.m.ts, uid: mask(k.m.uid), nick: k.m.nick, ok: k.m.ok, phase: k.m.phase, msg: k.m.msg,
+    ts: k.m.ts, uid: mask(k.m.uid), nick: k.m.nick, ok: k.m.ok, phase: k.m.phase,
+    trigger: k.m.trigger || null, // 历史日志的 metadata 无此字段（不读正文，保持接口轻量）
+    msg: k.m.msg,
   }));
   return new Response(JSON.stringify({ count: logs.length, logs }), { headers: JSON_H });
 }
@@ -893,9 +924,24 @@ export default {
       return new Response(JSON.stringify({ error: String((e && e.message) || e) }), { status: 500, headers: JSON_H });
     }
   },
-  async scheduled(_controller, env) { // Cron：走完整闸门
+  async scheduled(controller, env) { // Cron：走完整闸门
+    // controller 由 Cloudflare 传入，带着「实际使用的 cron 表达式」和「计划触发时间」。
+    // 记下来才能核对面板上配的表达式是否真的生效（之前这两个值是被丢掉的）。
+    const cronExpr = String((controller && controller.cron) || "");
+    const planSec = Math.floor(Number((controller && controller.scheduledTime) || Date.now()) / 1000);
+    // 入口先打一行实时日志：Cloudflare 的实时日志由平台保存、不依赖 KV，
+    // 判断「触发器到底有没有被调用」看这一行最直接（/logs 依赖 KV，KV 异常时会一起静默）。
+    console.log("[cron] 已触发", cronExpr, fmtCST(nowSec()));
+    // 心跳：进 scheduled 的第一件事就把「我来过」落盘，不依赖后续任何逻辑。
+    // 这样即便账号遍历失败、或一个账号都没有，也能证明触发器确实被调度过。
     try {
-      await runAll(env, "cron");
+      await setJSON(env.KV, CRON_KEY, { ts: nowSec(), cron: cronExpr, plan_at: planSec, plan_at_str: fmtCST(planSec) });
+    } catch (e) {
+      console.error("cron 心跳写入失败（KV 不可用？）：", (e && e.message) || e);
+    }
+    let result = null;
+    try {
+      result = await runAll(env, "cron");
     } catch (e) {
       // 兜底：runAll 在账号遍历前失败（如 kv.list 抛错）时，每个账号的 try/catch 都没机会执行，
       // state 和 log 都不会写，/logs 上会「什么都看不到」。这里补一条降级日志留证。
@@ -907,7 +953,21 @@ export default {
           `# CRON  ${fmtCST(ts)} (cron)\n结果：error  ${msg}\n\n[FATAL] 账号遍历前失败：${msg}\n`,
           {
             expirationTtl: LOG_TTL,
-            metadata: { ts, uid: "", nick: "CRON", ok: false, phase: "error", msg: msg.slice(0, 80) },
+            metadata: { ts, uid: "", nick: "CRON", ok: false, phase: "error", trigger: "cron", msg: msg.slice(0, 80) },
+          });
+      } catch {}
+      return; // 已在上面留了 FATAL 日志，不再往下补「0 账号」那条
+    }
+    // 0 账号时 runAll 的 for 循环不会执行、一条日志都不会写，
+    // 结果「没配账号」和「触发器没跑」在 /logs 上长得一模一样。补一条留痕，让 cron 是否执行过永远可查。
+    if (!result || !result.count) {
+      try {
+        const ts = nowSec(), tsMs = Date.now();
+        await env.KV.put(`log:${tsMs}:cron`,
+          `# CRON  ${fmtCST(ts)} (cron)\n结果：skipped  未配置任何账号\n\n[WARN] 本次 Cron 已执行，但 KV 中没有 acct: 账号，无需签到。\n`,
+          {
+            expirationTtl: LOG_TTL,
+            metadata: { ts, uid: "", nick: "CRON", ok: true, phase: "skipped", trigger: "cron", msg: "cron 已执行，但未配置任何账号" },
           });
       } catch {}
     }
