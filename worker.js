@@ -31,10 +31,10 @@
 
 // ============================================================
 // 页面展示的构建版本：日期（yyyymmdd）+ 当天第几次改动
-// 每次改动代码后手动把冒号后的序号 +1；跨天则换成当天日期、序号从 1 重新开始。
+// 当天第几个改动就写几；跨天则换成当天日期、序号从 1 重新开始。
 // 页脚会显示它——配合自动部署时，刷新页面看这一行变没变，就知道新版本上线没有。
 // ============================================================
-const BUILD_VERSION = "20260912:1";
+const BUILD_VERSION = "20260912:2";
 
 // ============================================================
 // 常量（对齐 Python）
@@ -605,8 +605,20 @@ function toolbar() {
     `</div>`;
 }
 
-/* —— 首页：账号 + 立即签到 + 运行日志 + 可用操作（对齐 WorkBuddy 首页） —— */
+/* —— 定时任务心跳卡：一眼看出「cron 到底有没有来过」，不依赖账号是否配置、也不依赖当时是否在看实时日志 —— */
+function cronCard(hb) {
+  return hb
+    ? `<div class="card"><div class="accname">定时任务（Cron）</div>` +
+      `<div class="report" style="color:#2F6B12;">上次触发：${escapeHtml(fmtCST(hb.ts))}</div>` +
+      `<div class="meta">Cloudflare 使用的表达式：<code>${escapeHtml(hb.cron || "未提供")}</code> · 计划时间 ${escapeHtml(hb.plan_at_str || "-")}</div></div>`
+    : `<div class="card warn"><div class="accname">定时任务（Cron）</div>` +
+      `<div class="report" style="color:#B03A3C;">尚无触发记录</div>` +
+      `<div class="meta">若面板上已配置 Cron 触发器、此卡却长期为空，说明定时任务没有被调度到（代码侧无法影响调度，需查触发器配置与域名绑定的 Worker）。</div></div>`;
+}
+
+/* —— 首页：定时任务心跳 + 账号 + 立即签到 + 运行日志 + 可用操作（与 WorkBuddy 首页一致） —— */
 async function renderHome(env) {
+  const cronBlock = cronCard(await getJSON(env.KV, CRON_KEY, null));
   let accBlock;
   try {
     const { keys } = await env.KV.list({ prefix: "acct:" });
@@ -648,6 +660,7 @@ async function renderHome(env) {
 
   const inner =
     '<div class="hd"><h2>Trae 签到 Worker</h2><span class="sub">云端自动签到 · Token 自动续期 · 幂等可重复执行</span></div>' +
+    cronBlock +
     accBlock +
     '<div class="btnrow" style="margin-top:6px;"><a href="/run">▶ 立即签到</a><a href="/logs">运行日志</a></div>' +
     '<h3>可用操作</h3><div class="tbl-scroll"><table><tbody>' + rows + "</tbody></table></div>" +
@@ -696,14 +709,7 @@ async function renderStatus(env) {
   const body = any
     ? cards.join("")
     : '<div class="card">尚未录入任何账号。通过 <code>/login-url</code> + <code>/callback</code>（需 <code>X-Admin-Token</code>）录入后此页会展示账号与 Token 状态。</div>';
-  // 定时任务心跳卡：一眼看出「cron 到底有没有来过」，不依赖账号是否配置、也不依赖当时是否在看实时日志
-  const cronBlock = hb
-    ? `<div class="card"><div class="accname">定时任务（Cron）</div>` +
-      `<div class="report" style="color:#2F6B12;">上次触发：${escapeHtml(fmtCST(hb.ts))}</div>` +
-      `<div class="meta">Cloudflare 使用的表达式：<code>${escapeHtml(hb.cron || "未提供")}</code> · 计划时间 ${escapeHtml(hb.plan_at_str || "-")}</div></div>`
-    : `<div class="card warn"><div class="accname">定时任务（Cron）</div>` +
-      `<div class="report" style="color:#B03A3C;">尚无触发记录</div>` +
-      `<div class="meta">若面板上已配置 Cron 触发器、此卡却长期为空，说明定时任务没有被调度到（代码侧无法影响调度，需查触发器配置与域名绑定的 Worker）。</div></div>`;
+  const cronBlock = cronCard(hb); // 与首页共用同一张卡（见 cronCard）
   const inner =
     '<div class="hd"><h2>Trae 账号状态</h2><span class="sub">Token 到期 / 最近运行 · 不显示 Token 明文</span></div>' +
     toolbar() + cronBlock + body +
