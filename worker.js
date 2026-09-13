@@ -24,7 +24,8 @@
  *   7. scheduled() 入口补一行 console.log（实时日志不依赖 KV），并在 0 账号时也写一条日志，
  *      使「触发器没被调用」与「调用了但没配账号」在实时日志 / /logs 上可区分
  *   8. scheduled() 入口落一条 cron 心跳到 KV（cron:last，含 Cloudflare 实际使用的表达式与计划时间），
- *      并在 /status 上展示——「定时任务到底有没有来过」从此可持久查询，不必依赖当时是否有人看实时日志
+ *      并在首页与 /status 上展示（页面只显示上次触发时间；表达式与计划时间在 /status JSON 的 cron_last 字段里）
+ *      ——「定时任务到底有没有来过」从此可持久查询，不必依赖当时是否有人看实时日志
  *   9. /logs 标注执行来源（定时触发 / 手动 · /run）：新日志写进 metadata.trigger，
  *      历史日志从正文首行的 (cron)/(manual) 兜底解析，页面与 JSON 都带上
  */
@@ -34,7 +35,7 @@
 // 当天第几个改动就写几；跨天则换成当天日期、序号从 1 重新开始。
 // 页脚会显示它——配合自动部署时，刷新页面看这一行变没变，就知道新版本上线没有。
 // ============================================================
-const BUILD_VERSION = "20260912:3";
+const BUILD_VERSION = "20260913:1";
 
 // ============================================================
 // 常量（对齐 Python）
@@ -612,12 +613,12 @@ function toolbar() {
     `</div>`;
 }
 
-/* —— 定时任务心跳卡：一眼看出「cron 到底有没有来过」，不依赖账号是否配置、也不依赖当时是否在看实时日志 —— */
+/* —— 定时任务心跳卡：一眼看出「cron 到底有没有来过」，不依赖账号是否配置、也不依赖当时是否在看实时日志。
+   卡片只显示上次触发时间；Cloudflare 实际使用的表达式与计划时间仍在 /status JSON 的 cron_last 字段里，需要核对时程序调用查询 —— */
 function cronCard(hb) {
   return hb
     ? `<div class="card"><div class="accname">定时任务（Cron）</div>` +
-      `<div class="report" style="color:#2F6B12;">上次触发：${escapeHtml(fmtCST(hb.ts))}</div>` +
-      `<div class="meta">Cloudflare 使用的表达式：<code>${escapeHtml(hb.cron || "未提供")}</code> · 计划时间 ${escapeHtml(hb.plan_at_str || "-")}</div></div>`
+      `<div class="report" style="color:#2F6B12;">上次触发：${escapeHtml(fmtCST(hb.ts))}</div></div>`
     : `<div class="card warn"><div class="accname">定时任务（Cron）</div>` +
       `<div class="report" style="color:#B03A3C;">尚无触发记录</div>` +
       `<div class="meta">若面板上已配置 Cron 触发器、此卡却长期为空，说明定时任务没有被调度到（代码侧无法影响调度，需查触发器配置与域名绑定的 Worker）。</div></div>`;
@@ -640,9 +641,10 @@ async function renderHome(env) {
         const left = Math.floor(((a.expires_at || 0) - nowSec()) / 86400);
         let t = escapeHtml(nm);
         if (a.expires_at) {
-          if (left < 0) t += `，<span style="color:#B03A3C;">令牌已过期（${fmtCST(a.expires_at)}）</span>`;
-          else if (left <= 7) t += `，<span style="color:#B03A3C;">令牌剩 ${left} 天（${fmtCST(a.expires_at)} 到期）</span>`;
-          else t += `，令牌剩 ${left} 天（${fmtCST(a.expires_at)} 到期）`;
+          // 与 WorkBuddy 版统一：只显示日期（精确到秒的到期时刻对用户没有可操作性）
+          if (left < 0) t += `，<span style="color:#B03A3C;">令牌已过期（${cstDay(a.expires_at)}）</span>`;
+          else if (left <= 7) t += `，<span style="color:#B03A3C;">令牌剩 ${left} 天（${cstDay(a.expires_at)} 到期）</span>`;
+          else t += `，令牌剩 ${left} 天（${cstDay(a.expires_at)} 到期）`;
         }
         return t;
       });
@@ -691,7 +693,7 @@ async function renderStatus(env) {
     const left = Math.floor(((a.expires_at || 0) - nowSec()) / 86400);
     const expireMiddle = !a.expires_at ? "-"
       : (left < 0 ? `<span style="color:#B03A3C;">已过期</span>` : "剩 " + left + " 天");
-    const expireTail = a.expires_at ? " · " + fmtCST(a.expires_at) : "";
+    const expireTail = a.expires_at ? " · " + cstDay(a.expires_at) : ""; // 只到日期，完整时间戳在下方原始 JSON 里
     // 逐字段转义后拼接（不要先拼好 HTML 再整体 escapeHtml——那样会把上面的 <span> 转成字面文本）。
     // expireMiddle / expireTail 之外的片段都可能含 KV 里的数据，这里统一 escapeHtml 兜住。
     const meta = [
@@ -742,7 +744,7 @@ function renderRunResult(result) {
       "</div>";
   }).join("");
   const inner =
-    '<div class="hd"><h2>签到执行结果</h2><span class="sub">' + escapeHtml(result.ran_at) + " · 共 " + result.count + " 个账号</span></div>" +
+    '<div class="hd"><h2>签到执行结果</h2><span class="sub">' + escapeHtml(result.ran_at) + " · " + escapeHtml(triggerLabel(result.trigger)) + " · 共 " + result.count + " 个账号</span></div>" +
     toolbar() + cards +
     "<details><summary>查看本次完整 JSON</summary><pre>" + escapeHtml(JSON.stringify(result, null, 2)) + "</pre></details>";
   return htmlRes(pageShell("Trae 签到结果", inner, false)); // 不自动刷新，避免定时重复执行
