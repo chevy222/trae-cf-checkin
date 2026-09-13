@@ -3,7 +3,7 @@
 **只有一个代码文件 `worker.js`，不需要安装 Node / npm / wrangler，在 Cloudflare 网页控制台粘贴即可。**
 
 - 定时自动签到，先查状态再领取，**不会重复领**；
-- Token 过期前 24 小时自动静默续期；
+- Token 过期前 72 小时自动静默续期；也可随时用 `/refresh` 手动强制刷新（需口令）；
 - 遇到服务器繁忙（9074）自动退避，等下一个周期再试；
 - 运行日志存在 KV，浏览器打开 `/logs` 就能看，保留 30 天；日志会标注是**定时触发**还是**手动跑的**；
 - 定时任务带独立心跳，首页与 `/status` 一眼看出"上次 Cron 什么时候跑的"（表达式与计划时间在 `/status` JSON 的 `cron_last` 字段里）；
@@ -143,7 +143,7 @@ foreach ($p in $paths) {
 
 ## 7. 第六步：录入凭证（登录一次）
 
-录入只需要做一次；以后 Token 会自动续期，除非 refresh token 也失效（届时重做本步即可）。
+录入只需要做一次；以后 Token 会在到期前 72 小时内自动续期（想立即续可用 `/refresh`，见第 9 节），除非 refresh token 也失效（届时重做本步即可）。
 
 ### 7.1 获取并直接打开登录链接
 ```powershell
@@ -222,17 +222,19 @@ Invoke-RestMethod "$base/remove" -Method Post -Headers $h -ContentType "applicat
 |---|---|---|---|
 | `/` | GET | 否 | 首页：**定时任务心跳** / 账号 / 立即签到 / 运行日志 / 可用操作，**不执行任何签到** |
 | `/logs` | GET | 否 | 日志列表页（已脱敏，不含 Token，**标注执行来源**，行内可展开完整日志） |
+| `/refresh` | GET | **是** | 手动刷新所有账号 Token（强制换新，不受 72 小时阈值限制），程序调用返回 JSON |
 | `/login-url` | GET | **是** | 生成 Trae 登录链接 |
 | `/callback` | POST | **是** | 录入凭证，JSON：`{"callback_url":"...","aha_device_id":"..."}` |
 | `/remove` | POST | **是** | 删除账号，JSON：`{"uid":"数字"}`，默认连日志一起删 |
 | `/status` | GET | 否 | 账号、Token 到期、最近运行、限频闸门，以及**定时任务上次触发时间**（`cron_last`，含实际使用的表达式）；不含 Token 明文，浏览器=页面、程序调用=JSON |
 | `/run` | GET | 否 | 立即手动签到一次（逻辑与 Cron 一致，受限频闸门保护），浏览器打开即触发 |
 
-> 录入/删除凭证的 `/login-url`、`/callback`、`/remove` 需要鉴权头 `X-Admin-Token: <你的 ADMIN_TOKEN>`，用 PowerShell（或 Postman、Apifox）调用；`/run`、`/status`、`/logs` 浏览器直接打开即可（`/run` 打开就会真的跑一次签到）。
+> 录入/删除凭证与手动刷新 Token 的 `/login-url`、`/callback`、`/remove`、`/refresh` 需要鉴权头 `X-Admin-Token: <你的 ADMIN_TOKEN>`，用 PowerShell（或 Postman、Apifox）调用；`/run`、`/status`、`/logs` 浏览器直接打开即可（`/run` 打开就会真的跑一次签到）。
 
 **习惯用 curl 的话**（Windows 上请用系统自带的 `curl.exe`，不要用 `curl` 别名）：
 ```powershell
 curl.exe -H "X-Admin-Token: 你的口令" "$base/login-url"
+curl.exe -H "X-Admin-Token: 你的口令" "$base/refresh"
 curl.exe -X POST -H "X-Admin-Token: 你的口令" -H "Content-Type: application/json" -d "{\"callback_url\":\"回调地址\",\"aha_device_id\":\"设备号\"}" "$base/callback"
 curl.exe "$base/run"
 curl.exe -X POST -H "X-Admin-Token: 你的口令" -H "Content-Type: application/json" -d "{\"uid\":\"要删除的uid\"}" "$base/remove"
@@ -247,6 +249,9 @@ curl.exe -X POST -H "X-Admin-Token: 你的口令" -H "Content-Type: application/
 
 **Q：返回 9074「当前参与用户太多/操作太频繁」怎么办？**
 两种可能：① 服务器繁忙，这是常态，程序已自动按 30/60/120/240/360 分钟退避，等下一次每日 Cron 即可，也可以随时打开 `$base/run` 手动补一次；② **Aha 设备号不对**（用成了随机号/UUID）——这种会一直 9074，请回到第五步核对 `aha_device_id` 是 16 位真实数字，并重新第七步录入。
+
+**Q：Token 快到期了，想立刻刷新不想等自动续期？**
+`Invoke-RestMethod "$base/refresh" -Headers $h`（GET，需口令）——强制给所有账号换新 Token，不受"剩 72 小时内才自动续"的阈值限制；返回里每个账号 `refreshed=true` 与新的有效期即成功。与签到共用并发锁，若恰逢定时任务在跑会返回"并发跳过"，稍等重试即可。
 
 **Q：日志里出现红色"需重新登录 login_required"？**
 说明 refresh token 也过期了，无法静默续期。重做第 7 步（`login-url` → 登录 → `callback`）即可恢复，KV 里的旧凭证会被覆盖。

@@ -8,9 +8,9 @@
  *     /run       GET 公开，手动签到（与 Cron 同逻辑，受限频闸门保护）
  *     /status    GET 公开，账号与 Token 碰撞状态（浏览器=页面，程序调用=JSON）
  *     /logs      GET 公开，运行日志列表（60 秒自动刷新，行内可展开完整日志）
- *     /login-url、/callback、/remove   仅需请求头 X-Admin-Token
+ *     /login-url、/callback、/remove、/refresh   仅需请求头 X-Admin-Token
  *   （已移除 /health 与 /log?id= 接口）
- * 存储：一个 KV Namespace，绑定名必须为 KV；一个密钥 ADMIN_TOKEN（仅 /login-url、/callback、/remove 用）
+ * 存储：一个 KV Namespace，绑定名必须为 KV；一个密钥 ADMIN_TOKEN（仅 /login-url、/callback、/remove、/refresh 用）
  * 逻辑要点：token 预刷新、status 免费先查、claim 单次、
  *   9074 退避状态写 KV 交下一个 Cron；云端不做进程内长睡眠
  *
@@ -35,7 +35,7 @@
 // 当天第几个改动就写几；跨天则换成当天日期、序号从 1 重新开始。
 // 页脚会显示它——配合自动部署时，刷新页面看这一行变没变，就知道新版本上线没有。
 // ============================================================
-const BUILD_VERSION = "20260913:1";
+const BUILD_VERSION = "20260913:2";
 
 // ============================================================
 // 常量（对齐 Python）
@@ -48,7 +48,7 @@ const AUTH_HOST = "https://api.trae.com.cn";   // 认证
 const CREDITS_HOST = "https://api.trae.cn";     // 签到/积分
 const LOGIN_PAGE = "https://www.trae.cn/authorization";
 
-const REFRESH_AHEAD_SEC = 24 * 3600;        // 过期前 24h 预刷新
+const REFRESH_AHEAD_SEC = 72 * 3600;        // 过期前 72h 预刷新（每天一次 Cron，提前 3 天兜住漏跑风险）
 const MIN_CLAIM_INTERVAL_SEC = 30 * 60;     // 检查点最小间隔 30 分钟
 const MAX_DAILY_ATTEMPTS = 20;              // 每日 claim 上限
 const BACKOFF_PAUSE_MIN = [30, 60, 120, 240, 360]; // 9074 跨 Cron 退避档（分钟）
@@ -345,6 +345,43 @@ async function provision(env, body, logger) {
   await setJSON(env.KV, acctKey(uid), acct); // guard 键无需预写：loadGuard 自带默认值与跨天重置，首次运行时自动落盘
   logger.info("凭证已录入 UID", uid, "昵称", acct.nickname, "Aha", aha, "有效期至", fmtCST(expiresAt));
   return { uid, nickname: acct.nickname, aha_device_id: aha, expires_at: expiresAt, expires_at_str: fmtCST(expiresAt) };
+}
+
+// ============================================================
+// 手动刷新全部账号 Token（/refresh，需 X-Admin-Token；不受 72h 阈值限制，强制换新）
+// ============================================================
+async function refreshAllTokens(env) {
+  const kv = env.KV;
+  const { keys } = await kv.list({ prefix: "acct:" });
+  const out = [];
+  for (const { name } of keys) {
+    const acct = await getJSON(kv, name, null);
+    if (!acct || !acct.uid) continue;
+    const summary = { uid: acct.uid, nickname: acct.nickname || "", refreshed: false, message: "" };
+    // 与签到共用同一把锁：exchangeToken 会轮换 refresh_token，
+    // 手动刷新与 Cron 签到并发时两边同用旧 refresh_token，可能互相把对方刷失效
+    if (await kv.get(lockKey(acct.uid))) {
+      summary.message = "已有运行在途，跳过（并发保护），稍后重试";
+      out.push(summary);
+      continue;
+    }
+    await kv.put(lockKey(acct.uid), JSON.stringify({ since: nowSec(), trigger: "refresh" }), { expirationTtl: LOCK_TTL });
+    try {
+      if (!acct.refresh_token) throw new Error("该账号无 refresh_token（历史兜底方式录入），需重新走 /callback 录入");
+      const tok = await exchangeToken(acct.refresh_token);
+      const updated = { ...acct, ...tok, updated_at: nowSec() };
+      await setJSON(kv, acctKey(acct.uid), updated);
+      summary.refreshed = true;
+      summary.message = `已刷新，有效期至 ${fmtCST(updated.expires_at)}`;
+      console.log("[refresh] UID", acct.uid, summary.message);
+    } catch (e) {
+      summary.message = (e instanceof AuthError ? "登录态已失效，需重新走 /callback 录入：" : "刷新失败：") + String((e && e.message) || e);
+    } finally {
+      await kv.delete(lockKey(acct.uid)).catch(() => {});
+    }
+    out.push(summary);
+  }
+  return { ran_at: fmtCST(nowSec()), count: out.length, accounts: out };
 }
 
 // ============================================================
@@ -661,6 +698,7 @@ async function renderHome(env) {
     ["<a href=\"/status\">/status</a>", "查看账号与 Token 到期 / 最近一次运行状态"],
     ["<a href=\"/logs\">/logs</a>", "最近 " + LOG_LIST_LIMIT + " 次运行日志（60 秒自动刷新，可展开详情）"],
     ["/login-url", "生成 Trae 登录链接（GET，需 X-Admin-Token）"],
+    ["/refresh", "手动刷新所有账号 Token（GET，需 X-Admin-Token，强制换新不受 72 小时阈值限制）"],
     ["/callback", "录入 / 更新凭证（POST，需 X-Admin-Token，JSON 见 README）"],
     ["/remove", "删除某账号及其日志（POST，需 X-Admin-Token）"],
   ].map(([path, desc]) =>
@@ -673,7 +711,7 @@ async function renderHome(env) {
     accBlock +
     '<div class="btnrow" style="margin-top:6px;"><a href="/run">▶ 立即签到</a><a href="/logs">运行日志</a></div>' +
     '<h3>可用操作</h3><div class="tbl-scroll"><table><tbody>' + rows + "</tbody></table></div>" +
-    '<p class="sub" style="margin-top:12px;">提示：<code>/run</code>、<code>/status</code>、<code>/logs</code> 公开、浏览器可直接打开；录入/删除凭证的 <code>/login-url</code>、<code>/callback</code>、<code>/remove</code> 需请求头 <code>X-Admin-Token</code>。程序调用时返回 JSON。</p>';
+    '<p class="sub" style="margin-top:12px;">提示：<code>/run</code>、<code>/status</code>、<code>/logs</code> 公开、浏览器可直接打开；录入/删除凭证与手动刷新 Token 的 <code>/login-url</code>、<code>/callback</code>、<code>/remove</code>、<code>/refresh</code> 需请求头 <code>X-Admin-Token</code>。程序调用时返回 JSON。</p>';
   return htmlRes(pageShell("Trae 签到 Worker", inner, false));
 }
 
@@ -833,7 +871,7 @@ async function handleFetch(req, env) {
     if (wantsHtml(req)) return renderHome(env);
     return new Response(JSON.stringify({
       ok: true,
-      report: "Trae 签到 Worker 运行中。路径：/run（立即签到）、/status（账号状态）、/logs（运行日志）；浏览器访问为可视化页面。录入/删除凭证的 /login-url、/callback、/remove 需请求头 X-Admin-Token。",
+      report: "Trae 签到 Worker 运行中。路径：/run（立即签到）、/status（账号状态）、/logs（运行日志）；浏览器访问为可视化页面。录入/删除凭证与手动刷新 Token 的 /login-url、/callback、/remove、/refresh 需请求头 X-Admin-Token。",
     }), { headers: JSON_H });
   }
 
@@ -868,10 +906,15 @@ async function handleFetch(req, env) {
   if (path === "/run" && method === "POST")
     return new Response(JSON.stringify({ error: "method not allowed：/run 请用 GET 访问" }), { status: 405, headers: JSON_H });
 
-  // —— 录入/删除凭证的接口需要 X-Admin-Token ——
-  if (path === "/login-url" || path === "/callback" || path === "/remove") {
+  // —— 录入/删除凭证、手动刷新 Token 的接口需要 X-Admin-Token ——
+  if (path === "/login-url" || path === "/callback" || path === "/remove" || path === "/refresh") {
     const deny = requireAdmin(req, env);
     if (deny) return deny;
+
+    if (path === "/refresh" && method === "GET") {
+      const result = await refreshAllTokens(env);
+      return new Response(JSON.stringify({ ok: true, ...result }), { headers: JSON_H });
+    }
 
     if (path === "/login-url" && method === "GET") {
       const machineId = randHex(16), deviceId = randHex(16);
