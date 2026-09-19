@@ -32,7 +32,8 @@
 - 一个 **Cloudflare 账号**（免费即可），并已开启 `workers.dev` 子域名（首次进 Workers & Pages 时按提示设置一次，例如选一个你自己的子域名前缀）。
 - 电脑上能正常登录 **Trae 客户端 / 网页**，并且本机装过 Trae 客户端（用来取设备号，见第五步）。
 - 你的 Worker 访问地址，部署后形如：`https://<worker名>.<你的子域>.workers.dev`，下面统一用 `$base` 代指。
-- 命令在 **Windows PowerShell** 里执行（开始菜单搜 PowerShell）。本说明给的是 PowerShell 原生命令，不依赖 curl 转义，最省心；PowerShell 变量统一在第五步初始化。
+- 命令在**终端**里执行：**Windows** 用 PowerShell（开始菜单搜 PowerShell）；**macOS** 用「终端」Terminal（`Command+空格` 搜 `终端` / `Terminal` 回车，系统默认 zsh 即可）。两边给的都是一行行直白的原生命令，不依赖 curl 转义，最省心；变量统一在第五步初始化。
+- **下文每个命令块都同时给出 Windows 与 macOS 两个版本**（代码块里用 `# Windows` / `# macOS` 或小标题标注），照自己系统的抄对应那份即可；没有标注的说明两个系统通用。
 
 ---
 
@@ -41,7 +42,7 @@
 1. 登录 Cloudflare 控制台，左侧进 **Workers & Pages** → **Create**（创建）→ 选 **Workers**（从 Hello World 模板开始即可）。
 2. 给 Worker 起个名，例如 `trae-checkin`，点 **Deploy / 部署**。
 3. 部署后点 **Edit code / 编辑代码**，把编辑器里自带的内容**全部删掉**。
-4. 用记事本打开本目录的 **`worker.js`**，全选复制，整段粘贴进网页编辑器。
+4. 用文本编辑器打开本目录的 **`worker.js`**（Windows：记事本；macOS：文本编辑 TextEdit，或 VS Code 等），全选复制（Windows `Ctrl+A` / macOS `Cmd+A`），整段粘贴进网页编辑器。
 5. 点右上角 **Deploy / 部署**。
 
 部署成功后，访问 `https://<worker名>.<你的子域>.workers.dev/` 能看到首页：已配置账号、**立即签到**、**运行日志**、**可用操作**，就说明代码上线了（首页不执行任何签到任务）。
@@ -67,7 +68,7 @@ KV 是 Cloudflare 的键值存储，用来存凭证、限频状态和日志。
 1. Worker → **Settings** → **Variables and Secrets（变量和机密）** → **Add**。
 2. 类型选 **Secret（加密/机密）**，名称填 **`ADMIN_TOKEN`**，值填一串你自己的口令（建议长一点、随机一点）。
 3. 保存并**重新部署一次**（部分情况下密钥需要重新部署才生效）。
-4. 同一个口令第五步会填进 PowerShell 的 `$token` 变量（在 7.1、7.3 录入凭证和 8.4 删除账号时用到）。
+4. 同一个口令第五步会填进终端的 `$token` 变量（Windows PowerShell 和 macOS 终端写法都一样是 `$token`；在 7.1、7.3 录入凭证和 8.4 删除账号时用到）。
 
 ---
 
@@ -111,14 +112,26 @@ Cron 表达式按 **UTC 时间**执行，北京时间 = UTC+8（UTC 小时 = 北
 
 这是**最容易踩坑、也最关键**的一步。签到接口要求请求头 `x-device-id` 是 Trae 客户端的 **16 位十进制设备号**；用随机字符会一直返回 9074。这个号在你本机 Trae 客户端的 `storage.json` 里。
 
-先打开 **Windows PowerShell**（开始菜单搜 PowerShell），初始化下面变量，后面命令都在**同一个窗口**里复用（替换成你自己的 Worker 地址和管理口令，地址结尾不要带斜杠；其中 `$h` 只在 7.1、7.3 录入凭证时用到）：
+先打开一个**终端**——**Windows** 是 PowerShell（开始菜单搜 PowerShell），**macOS** 是「终端」Terminal——初始化下面变量。后面所有命令都在**同一个窗口**里复用（把地址和口令替换成你自己的，地址结尾不要带斜杠）：
+
+**Windows PowerShell：**
 ```powershell
 $base  = "https://trae-checkin.你的子域.workers.dev"
 $token = "你自己设定的管理口令"
-$h = @{ "X-Admin-Token" = $token }
+$h = @{ "X-Admin-Token" = $token }   # 只在 7.1、7.3、8.4 用到
 ```
 
-**保持这个 PowerShell 窗口，再跑下面这段，自动把设备号找出来：**
+**macOS（Terminal，zsh / bash）：**
+```bash
+base="https://trae-checkin.你的子域.workers.dev"
+token="你自己设定的管理口令"
+```
+
+> 两者差别只在"怎么带上口令"：Windows 把它装进 `$h` 这个请求头集合，命令里写 `-Headers $h`；macOS 没有对应写法，命令里直接写 `-H "X-Admin-Token: $token"`，效果完全一样。
+
+**保持这个终端窗口，再跑下面这段，自动把设备号找出来：**
+
+**Windows PowerShell：**
 ```powershell
 $paths = @(
   "$env:APPDATA\TRAE SOLO CN\User\globalStorage\storage.json",
@@ -133,9 +146,23 @@ foreach ($p in $paths) {
   }
 }
 ```
-输出形如 `找到设备号: 3156057067629600`，**把这串数字记下来**（下面叫 `$aha`）。
 
-手动找也行：用记事本打开上面任一存在的 `storage.json`，搜索 `iCubeAuthInfo://icube-dc:`，冒号后面那串 16 位数字就是。
+**macOS（Terminal）：**
+```bash
+for p in \
+  "$HOME/Library/Application Support/TRAE SOLO CN/User/globalStorage/storage.json" \
+  "$HOME/Library/Application Support/Trae CN/User/globalStorage/storage.json" \
+  "$HOME/Library/Application Support/Trae/User/globalStorage/storage.json"
+do
+  [ -f "$p" ] && grep -oE 'icube-dc:[0-9]{8,16}' "$p" | sed 's/icube-dc:/找到设备号: /'
+done
+```
+
+> macOS 上这些文件在 `~/Library/Application Support/` 里（不是 Windows 的 `%APPDATA%`），三个候选名分别对应 SOLO 国内版、Trae 国内版、Trae 国际版；哪个存在就会打印哪一行，等于 Windows 版的效果。
+
+两者输出都形如 `找到设备号: 3156057067629600`，**把这串数字记下来**（下面叫 `$aha`）。
+
+手动找也行：用文本编辑器打开上面任一存在的 `storage.json`（Windows 记事本 / macOS 文本编辑 TextEdit），搜索 `iCubeAuthInfo://icube-dc:`，冒号后面那串 16 位数字就是。
 
 > 请用**与该客户端登录的同一个 Trae 账号**去做第七步，保证账号和设备号一致。
 
@@ -146,18 +173,36 @@ foreach ($p in $paths) {
 录入只需要做一次；以后 Token 会在到期前 72 小时内自动续期（想立即续可用 `/refresh`，见第 9 节），除非 refresh token 也失效（届时重做本步即可）。
 
 ### 7.1 获取并直接打开登录链接
+
+**Windows PowerShell：**
 ```powershell
 $r = Invoke-RestMethod "$base/login-url" -Headers $h
 Start-Process $r.login_url
 ```
-第二行会用默认浏览器**直接打开登录页**。不要把 `Invoke-RestMethod` 的结果直接打印在控制台看——返回的 `login_url` 很长，控制台表格会截断显示（值本身没丢，但复制不全）；存进变量再 `Start-Process` 打开最稳。如果只想复制不打开，用 `Set-Clipboard $r.login_url`。登录链接**现取现用**，每次都会生成新的。
+
+**macOS（Terminal）：**
+```bash
+# 取到链接后直接用默认浏览器打开（只用系统自带工具，不依赖 jq）
+open "$(curl -s -H "X-Admin-Token: $token" "$base/login-url" \
+  | sed -nE 's/.*"login_url":"([^"]*)".*/\1/p')"
+
+# 只想复制到剪贴板、不打开：
+curl -s -H "X-Admin-Token: $token" "$base/login-url" \
+  | sed -nE 's/.*"login_url":"([^"]*)".*/\1/p' | pbcopy
+```
+
+最后一步会用默认浏览器**直接打开登录页**。不要把原始返回（Windows 的 `Invoke-RestMethod`、macOS 的 `curl` 输出）直接打印在控制台看——返回的 `login_url` 很长，控制台会截断显示（值本身没丢，但复制不全）；Windows 存进变量再 `Start-Process` 打开、macOS 用 `open "$(...)"` 包住最稳。只想复制不打开：Windows 用 `Set-Clipboard $r.login_url`，macOS 用管道 `pbcopy`（见上面第二段）。登录链接**现取现用**，每次都会生成新的。
+
+> macOS 里那句 `sed -nE 's/.*"login_url":"([^"]*)".*/\1/p'` 就是从 JSON 里抠出 `login_url` 的值；若本机装了 `jq`（`brew install jq`），可以换成更直观的 `curl -s -H "X-Admin-Token: $token" "$base/login-url" | jq -r .login_url`。
 
 ### 7.2 浏览器登录并复制回调地址
 1. 登录页已由 7.1 自动打开，用手机号/验证码登录你的 Trae 账号（与 Aha 设备号同一账号）。
 2. 登录成功后浏览器会跳转到一个 **`http://127.0.0.1:18080/authorize?...` 开头、并且显示"无法访问此网站/打不开"的页面——这是正常的**。
-3. 在该页面地址栏点一下，`Ctrl+A`、`Ctrl+C`，**把这一整条完整 URL 复制下来**（很长，带 `refreshToken=...` 等参数；在浏览器里复制不会被截断）。
+3. 在该页面地址栏点一下，Windows 按 `Ctrl+A`、`Ctrl+C`，macOS 按 `Cmd+A`、`Cmd+C`，**把这一整条完整 URL 复制下来**（很长，带 `refreshToken=...` 等参数；在浏览器里复制不会被截断）。
 
 ### 7.3 提交给 Worker
+
+**Windows PowerShell：**
 ```powershell
 # 把下面两行替换成你的真实值：
 $cb  = "粘贴上一步复制的 127.0.0.1 开头的完整地址"
@@ -166,6 +211,25 @@ $aha = "第六步拿到的16位设备号"
 $body = @{ callback_url = $cb; aha_device_id = $aha } | ConvertTo-Json
 Invoke-RestMethod -Uri "$base/callback" -Method Post -Headers $h -ContentType "application/json" -Body $body
 ```
+
+**macOS（Terminal）：**
+```bash
+# 把下面两行替换成你的真实值：
+cb="粘贴上一步复制的 127.0.0.1 开头的完整地址"
+aha="第六步拿到的16位设备号"
+
+curl -s -X POST "$base/callback" \
+  -H "X-Admin-Token: $token" \
+  -H "Content-Type: application/json" \
+  -d "{\"callback_url\":\"$cb\",\"aha_device_id\":\"$aha\"}"
+```
+
+> macOS 若因为回调地址里含特殊字符（`"`、`\` 等）把 JSON 拼坏、返回解析错误，可用 `jq` 构造 body 更稳（需先 `brew install jq`）：
+> ```bash
+> curl -s -X POST "$base/callback" -H "X-Admin-Token: $token" -H "Content-Type: application/json" \
+>   -d "$(jq -n --arg cb "$cb" --arg aha "$aha" '{callback_url:$cb, aha_device_id:$aha}')"
+> ```
+
 成功会返回 `ok=true`、你的 `uid / nickname / aha_device_id / expires_at_str`。看到这个就说明凭证已存进 KV。
 
 > 多账号：换一个 Trae 账号重复 7.1～7.3 即可，Cron 会自动遍历所有已录入账号。
@@ -176,7 +240,12 @@ Invoke-RestMethod -Uri "$base/callback" -Method Post -Headers $h -ContentType "a
 
 ### 8.1 立即手动跑一次（不等定时，无需口令）
 ```powershell
+# Windows PowerShell
 Invoke-RestMethod -Uri "$base/run"
+```
+```bash
+# macOS
+curl -s "$base/run"
 ```
 也就是**直接在浏览器打开 `$base/run`**（GET）即可触发（逻辑与 Cron 一致：受限频闸门/间隔/每日上限保护，只有 Token 临期才刷新）。浏览器会返回结果页；返回的 `accounts[0].phase` 含义：
 - `claimed`：本次签到成功；
@@ -200,17 +269,28 @@ https://<worker名>.<你的子域>.workers.dev/logs
 ```
 https://<worker名>.<你的子域>.workers.dev/status
 ```
-返回每个账号的昵称、设备号、Token 到期时间、最近一次运行状态，以及**限频闸门**（今日 claim 次数 / 是否处于限频暂停 / 连续限频次数 / 距下次可领取还有多久）——本次被"跳过"时，看一眼闸门那行就知道卡在哪一档（**不会返回 Token 明文**）；命令行 `Invoke-RestMethod -Uri "$base/status"` 返回 JSON，闸门状态在 `guard` 字段里。
+返回每个账号的昵称、设备号、Token 到期时间、最近一次运行状态，以及**限频闸门**（今日 claim 次数 / 是否处于限频暂停 / 连续限频次数 / 距下次可领取还有多久）——本次被"跳过"时，看一眼闸门那行就知道卡在哪一档（**不会返回 Token 明文**）；命令行 `Invoke-RestMethod -Uri "$base/status"`（macOS：`curl -s "$base/status"`）返回 JSON，闸门状态在 `guard` 字段里。
 
 页面顶部还有一张 **「定时任务（Cron）」** 卡片：显示**上次 Cron 触发的时间**。**这是判断「定时任务到底有没有跑」最直接的依据**——它由 `scheduled()` 进门第一件事写入 KV，不依赖账号是否配置，也不依赖当时有没有人盯着实时日志；卡片显示"尚无触发记录"就说明触发器没有被调度到（需要核对 Cloudflare 实际使用的表达式与计划时间时，程序调用 `/status` 看 JSON 的 `cron_last` 字段）。
 
 ### 8.4 删除某个账号（多账号时用）
 先从 8.3 的结果里找到要删账号的 `uid`（一串数字），然后（需要口令）：
+
+**Windows PowerShell：**
 ```powershell
 $body = @{ uid = "要删除账号的uid" } | ConvertTo-Json
 Invoke-RestMethod "$base/remove" -Method Post -Headers $h -ContentType "application/json" -Body $body
 ```
-会删掉该账号的凭证、限频状态、最近快照和它的历史日志，其它账号不受影响；返回 `ok=true` 即成功。想保留它的历史日志就把 body 改成 `@{ uid = "..."; keep_logs = $true }`。
+
+**macOS（Terminal）：**
+```bash
+curl -s -X POST "$base/remove" \
+  -H "X-Admin-Token: $token" \
+  -H "Content-Type: application/json" \
+  -d "{\"uid\":\"要删除账号的uid\"}"
+```
+
+会删掉该账号的凭证、限频状态、最近快照和它的历史日志，其它账号不受影响；返回 `ok=true` 即成功。想保留它的历史日志：Windows 把 body 改成 `@{ uid = "..."; keep_logs = $true }`，macOS 改成 `{"uid":"...","keep_logs":true}`。
 
 > 不想重新部署也能手动删：控制台 **Storage & Databases → KV → 你的命名空间 → View**，搜索该 uid，删除 `acct:<uid>`、`guard:<uid>`、`state:<uid>` 三个键即可（删掉 `acct:` 就不会再被签到；`log:<uid>:*` 是日志，可留着 30 天自动过期）。另有 `cron:last` 一个全局键，记录最近一次定时任务触发的心跳，不属于任何账号，可保留不管。
 
@@ -229,15 +309,26 @@ Invoke-RestMethod "$base/remove" -Method Post -Headers $h -ContentType "applicat
 | `/status` | GET | 否 | 账号、Token 到期、最近运行、限频闸门，以及**定时任务上次触发时间**（`cron_last`，含实际使用的表达式）；不含 Token 明文，浏览器=页面、程序调用=JSON |
 | `/run` | GET | 否 | 立即手动签到一次（逻辑与 Cron 一致，受限频闸门保护），浏览器打开即触发 |
 
-> 录入/删除凭证与手动刷新 Token 的 `/login-url`、`/callback`、`/remove`、`/refresh` 需要鉴权头 `X-Admin-Token: <你的 ADMIN_TOKEN>`，用 PowerShell（或 Postman、Apifox）调用；`/run`、`/status`、`/logs` 浏览器直接打开即可（`/run` 打开就会真的跑一次签到）。
+> 录入/删除凭证与手动刷新 Token 的 `/login-url`、`/callback`、`/remove`、`/refresh` 需要鉴权头 `X-Admin-Token: <你的 ADMIN_TOKEN>`，用终端命令（Windows PowerShell / macOS `curl`，或 Postman、Apifox）调用；`/run`、`/status`、`/logs` 浏览器直接打开即可（`/run` 打开就会真的跑一次签到）。
 
-**习惯用 curl 的话**（Windows 上请用系统自带的 `curl.exe`，不要用 `curl` 别名）：
+**习惯用 curl 的话**，两个系统都是系统自带、无需安装：
+
+**Windows** 请用 `curl.exe`，不要用 `curl` 别名（PowerShell 里 JSON 的双引号需要 `\"` 转义）：
 ```powershell
 curl.exe -H "X-Admin-Token: 你的口令" "$base/login-url"
 curl.exe -H "X-Admin-Token: 你的口令" "$base/refresh"
 curl.exe -X POST -H "X-Admin-Token: 你的口令" -H "Content-Type: application/json" -d "{\"callback_url\":\"回调地址\",\"aha_device_id\":\"设备号\"}" "$base/callback"
 curl.exe "$base/run"
 curl.exe -X POST -H "X-Admin-Token: 你的口令" -H "Content-Type: application/json" -d "{\"uid\":\"要删除的uid\"}" "$base/remove"
+```
+
+**macOS** 直接用 `curl`；JSON 用**单引号**包住即可，不必转义双引号（写起来比 PowerShell 干净）：
+```bash
+curl -s -H "X-Admin-Token: 你的口令" "$base/login-url"
+curl -s -H "X-Admin-Token: 你的口令" "$base/refresh"
+curl -s -X POST -H "X-Admin-Token: 你的口令" -H "Content-Type: application/json" -d '{"callback_url":"回调地址","aha_device_id":"设备号"}' "$base/callback"
+curl -s "$base/run"
+curl -s -X POST -H "X-Admin-Token: 你的口令" -H "Content-Type: application/json" -d '{"uid":"要删除的uid"}' "$base/remove"
 ```
 
 ---
@@ -251,7 +342,7 @@ curl.exe -X POST -H "X-Admin-Token: 你的口令" -H "Content-Type: application/
 两种可能：① 服务器繁忙，这是常态，程序已自动按 30/60/120/240/360 分钟退避，等下一次每日 Cron 即可，也可以随时打开 `$base/run` 手动补一次；② **Aha 设备号不对**（用成了随机号/UUID）——这种会一直 9074，请回到第五步核对 `aha_device_id` 是 16 位真实数字，并重新第七步录入。
 
 **Q：Token 快到期了，想立刻刷新不想等自动续期？**
-`Invoke-RestMethod "$base/refresh" -Headers $h`（GET，需口令）——强制给所有账号换新 Token，不受"剩 72 小时内才自动续"的阈值限制；返回里每个账号 `refreshed=true` 与新的有效期即成功。与签到共用并发锁，若恰逢定时任务在跑会返回"并发跳过"，稍等重试即可。
+`Invoke-RestMethod "$base/refresh" -Headers $h`（Windows）或 `curl -s -H "X-Admin-Token: $token" "$base/refresh"`（macOS）（GET，需口令）——强制给所有账号换新 Token，不受"剩 72 小时内才自动续"的阈值限制；返回里每个账号 `refreshed=true` 与新的有效期即成功。与签到共用并发锁，若恰逢定时任务在跑会返回"并发跳过"，稍等重试即可。
 
 **Q：日志里出现红色"需重新登录 login_required"？**
 说明 refresh token 也过期了，无法静默续期。重做第 7 步（`login-url` → 登录 → `callback`）即可恢复，KV 里的旧凭证会被覆盖。
@@ -287,8 +378,14 @@ curl.exe -X POST -H "X-Admin-Token: 你的口令" -H "Content-Type: application/
 **Q：`/logs` 是公开的，安全吗？**
 日志页不需要口令是为了方便收藏，但内容**不含任何 Token**，只显示昵称、结果和过程，且日志列表只读 `log:` 前缀的键（无法读到 `acct:` 凭证）。你的 `workers.dev` 地址本身不公开、别人很难猜。如果你仍希望日志页也加口令，可在 `worker.js` 的 `/logs` 分支加上和 `/login-url` 一样的口令校验。
 
-**Q：PowerShell 报 `Invoke-RestMethod` 401 / unauthorized？**
-只有 `/login-url`、`/callback` 需要口令：说明 `$token` 和控制台里的 `ADMIN_TOKEN` 不一致，或密钥设置后没重新部署；检查请求头 `X-Admin-Token`。`/run`、`/status`、`/logs` 不需要口令，别给它们加 `-Headers $h`（加了也不影响）。
+**Q：终端报 401 / unauthorized（Windows 的 `Invoke-RestMethod`、macOS 的 `curl`）？**
+只有 `/login-url`、`/callback`、`/remove`、`/refresh` 需要口令：说明 `$token` 和控制台里的 `ADMIN_TOKEN` 不一致，或密钥设置后没重新部署；检查请求头 `X-Admin-Token`（Windows 写作 `-Headers $h`，macOS 写作 `-H "X-Admin-Token: $token"`）。`/run`、`/status`、`/logs` 不需要口令，别给它们带鉴权头（带了也不影响）。
+
+**Q：macOS 提示 `jq: command not found`？**
+不需要装。本说明的 macOS 命令默认只用系统自带工具（`curl`、`grep`、`sed`、`open`、`pbcopy`），能跑通全流程；只有正文里明确标注为"jq 备选"的写法才需要 `brew install jq`。
+
+**Q：macOS 上跑找设备号那段，什么都没输出？**
+说明三个候选路径都不存在。到 `~/Library/Application Support/` 下看看 Trae 相关目录到底叫什么名字（`ls ~/Library/Application\ Support/ | grep -i trae`），再把实测存在的那个路径按同样格式补进 `for p in ...` 列表即可；也可以直接手动打开那个 `storage.json` 搜 `iCubeAuthInfo://icube-dc:`。
 
 **Q：`callback` 报"ExchangeToken 鉴权失败"？**
 回调链接过期或不完整。重新走 7.1 取新链接、重新登录、复制**完整**地址再提交。
@@ -309,7 +406,7 @@ curl.exe -X POST -H "X-Admin-Token: 你的口令" -H "Content-Type: application/
 **彻底卸载**
 1. Workers & Pages 里删除这个 Worker；
 2. Storage & Databases → KV 里删除对应命名空间（凭证、状态、日志一并清除）；
-3. 无需清理本地任何东西（本方案不在你电脑上常驻，本地只用 PowerShell 发了几次请求）。
+3. 无需清理本地任何东西（本方案不在你电脑上常驻，本地只用终端发了几次请求：Windows 是 PowerShell，macOS 是「终端」）。
 
 ---
 
