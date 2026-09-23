@@ -32,7 +32,7 @@
 - 一个 **Cloudflare 账号**（免费即可），并已开启 `workers.dev` 子域名（首次进 Workers & Pages 时按提示设置一次，例如选一个你自己的子域名前缀）。
 - 电脑上能正常登录 **Trae 客户端 / 网页**，并且本机装过 Trae 客户端（用来取设备号，见第五步）。
 - 你的 Worker 访问地址，部署后形如：`https://<worker名>.<你的子域>.workers.dev`，下面统一用 `$base` 代指。
-- 命令在**终端**里执行：**Windows** 用 PowerShell（开始菜单搜 PowerShell）；**macOS** 用「终端」Terminal（`Command+空格` 搜 `终端` / `Terminal` 回车，系统默认 zsh 即可）。两边给的都是一行行直白的原生命令，不依赖 curl 转义，最省心；变量统一在第五步初始化。
+- 命令在**终端**里执行：**Windows** 用 PowerShell（开始菜单搜 PowerShell）；**macOS** 用「终端」Terminal（`Command+空格` 搜 `终端` / `Terminal` 回车，系统默认即为 zsh）。两边给的都是一行行直白的原生命令，不依赖 curl 转义，最省心；变量统一在第五步初始化。
 - **下文每个命令块都同时给出 Windows 与 macOS 两个版本**（代码块里用 `# Windows` / `# macOS` 或小标题标注），照自己系统的抄对应那份即可；没有标注的说明两个系统通用。
 
 ---
@@ -121,8 +121,8 @@ $token = "你自己设定的管理口令"
 $h = @{ "X-Admin-Token" = $token }   # 只在 7.1、7.3、8.4 用到
 ```
 
-**macOS（Terminal，zsh / bash）：**
-```bash
+**macOS（Terminal，zsh）：**
+```zsh
 base="https://trae-checkin.你的子域.workers.dev"
 token="你自己设定的管理口令"
 ```
@@ -148,7 +148,7 @@ foreach ($p in $paths) {
 ```
 
 **macOS（Terminal）：**
-```bash
+```zsh
 for p in \
   "$HOME/Library/Application Support/TRAE SOLO CN/User/globalStorage/storage.json" \
   "$HOME/Library/Application Support/Trae CN/User/globalStorage/storage.json" \
@@ -181,7 +181,7 @@ Start-Process $r.login_url
 ```
 
 **macOS（Terminal）：**
-```bash
+```zsh
 # 取到链接后直接用默认浏览器打开（只用系统自带工具，不依赖 jq）
 open "$(curl -s -H "X-Admin-Token: $token" "$base/login-url" \
   | sed -nE 's/.*"login_url":"([^"]*)".*/\1/p')"
@@ -213,7 +213,7 @@ Invoke-RestMethod -Uri "$base/callback" -Method Post -Headers $h -ContentType "a
 ```
 
 **macOS（Terminal）：**
-```bash
+```zsh
 # 把下面两行替换成你的真实值：
 cb="粘贴上一步复制的 127.0.0.1 开头的完整地址"
 aha="第六步拿到的16位设备号"
@@ -225,7 +225,7 @@ curl -s -X POST "$base/callback" \
 ```
 
 > macOS 若因为回调地址里含特殊字符（`"`、`\` 等）把 JSON 拼坏、返回解析错误，可用 `jq` 构造 body 更稳（需先 `brew install jq`）：
-> ```bash
+> ```zsh
 > curl -s -X POST "$base/callback" -H "X-Admin-Token: $token" -H "Content-Type: application/json" \
 >   -d "$(jq -n --arg cb "$cb" --arg aha "$aha" '{callback_url:$cb, aha_device_id:$aha}')"
 > ```
@@ -243,7 +243,7 @@ curl -s -X POST "$base/callback" \
 # Windows PowerShell
 Invoke-RestMethod -Uri "$base/run"
 ```
-```bash
+```zsh
 # macOS
 curl -s "$base/run"
 ```
@@ -283,7 +283,7 @@ Invoke-RestMethod "$base/remove" -Method Post -Headers $h -ContentType "applicat
 ```
 
 **macOS（Terminal）：**
-```bash
+```zsh
 curl -s -X POST "$base/remove" \
   -H "X-Admin-Token: $token" \
   -H "Content-Type: application/json" \
@@ -323,7 +323,7 @@ curl.exe -X POST -H "X-Admin-Token: 你的口令" -H "Content-Type: application/
 ```
 
 **macOS** 直接用 `curl`；JSON 用**单引号**包住即可，不必转义双引号（写起来比 PowerShell 干净）：
-```bash
+```zsh
 curl -s -H "X-Admin-Token: 你的口令" "$base/login-url"
 curl -s -H "X-Admin-Token: 你的口令" "$base/refresh"
 curl -s -X POST -H "X-Admin-Token: 你的口令" -H "Content-Type: application/json" -d '{"callback_url":"回调地址","aha_device_id":"设备号"}' "$base/callback"
