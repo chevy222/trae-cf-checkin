@@ -9,7 +9,6 @@
  *     /status    GET 公开，账号与 Token 碰撞状态（浏览器=页面，程序调用=JSON）
  *     /logs      GET 公开，运行日志列表（60 秒自动刷新，行内可展开完整日志）
  *     /login-url、/callback、/remove、/refresh   仅需请求头 X-Admin-Token
- *   （已移除 /health 与 /log?id= 接口）
  * 存储：一个 KV Namespace，绑定名必须为 KV；一个密钥 ADMIN_TOKEN（仅 /login-url、/callback、/remove、/refresh 用）
  * 逻辑要点：token 预刷新、status 免费先查、claim 单次、
  *   9074 退避状态写 KV 交下一个 Cron；云端不做进程内长睡眠
