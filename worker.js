@@ -86,8 +86,15 @@ function escapeHtml(s) {
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
-// 数字打码：保留首尾各 4 位，中间统一遮住 8 位（UID 与设备号同规则）
-const maskDigits = (v) => String(v == null ? "" : v).replace(/(\d{4})\d+(\d{4})/, "$1••••••••$2");
+// 数字打码：保留首尾各 4 位、中间统一遮住 8 位（UID 与设备号同规则）。
+// 长度不足 9 位时无法在保留首尾各 4 位的前提下遮蔽，退化为首尾各留 2 位；
+// 4 位及以下不再处理（遮了等于没遮）。调用点传入的都是纯数字串。
+function maskDigits(v) {
+  const s = String(v == null ? "" : v);
+  if (s.length > 8) return s.replace(/(\d{4})\d+(\d{4})/, "$1••••••••$2");
+  if (s.length > 4) return s.replace(/(\d{2})\d+(\d{2})/, "$1••••••••$2");
+  return s;
+}
 function safeEqual(a, b) { // 逐字节比较，尽量避免可测量的时序差异（长度不等时提前返回）
   const enc = new TextEncoder();
   const x = enc.encode(a || ""), y = enc.encode(b || "");
