@@ -13,21 +13,6 @@
  * 存储：一个 KV Namespace，绑定名必须为 KV；一个密钥 ADMIN_TOKEN（仅 /login-url、/callback、/remove、/refresh 用）
  * 逻辑要点：token 预刷新、status 免费先查、claim 单次、
  *   9074 退避状态写 KV 交下一个 Cron；云端不做进程内长睡眠
- *
- * 本轮加固（不影响接口，纯内部行为）：
- *   1. claim 响应的 code 不再用 `|| 0` 兜底，避免空 body 被误判成「签到成功」
- *   2. 「已签到」判定收窄为明确措辞，避免含“已”字的错误消息被当成成功
- *   3. HTTP 429 纳入退避，与 9074 同等对待
- *   4. 所有上游请求加 15s 超时；5xx 响应体写入日志前先做凭据脱敏
- *   5. scheduled() 加兜底 try/catch，遍历前失败也会留一条日志
- *   6. /status 页与 JSON 增加限频闸门状态；回调参数改为不经 '+' → 空格 转换的解析
- *   7. scheduled() 入口补一行 console.log（实时日志不依赖 KV），并在 0 账号时也写一条日志，
- *      使「触发器没被调用」与「调用了但没配账号」在实时日志 / /logs 上可区分
- *   8. scheduled() 入口落一条 cron 心跳到 KV（cron:last，含 Cloudflare 实际使用的表达式与计划时间），
- *      并在首页与 /status 上展示（页面只显示上次触发时间；表达式与计划时间在 /status JSON 的 cron_last 字段里）
- *      ——「定时任务到底有没有来过」从此可持久查询，不必依赖当时是否有人看实时日志
- *   9. /logs 标注执行来源（定时触发 / 手动 · /run）：新日志写进 metadata.trigger，
- *      历史日志从正文首行的 (cron)/(manual) 兜底解析，页面与 JSON 都带上
  */
 
 // ============================================================
@@ -35,7 +20,7 @@
 // 当天第几个改动就写几；跨天则换成当天日期、序号从 1 重新开始。
 // 页脚会显示它——配合自动部署时，刷新页面看这一行变没变，就知道新版本上线没有。
 // ============================================================
-const BUILD_VERSION = "20260913:2";
+const BUILD_VERSION = "20260927:1";
 
 // ============================================================
 // 常量（对齐 Python）
@@ -102,7 +87,9 @@ function escapeHtml(s) {
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
-function safeEqual(a, b) { // 恒定时间比较
+// 数字打码：保留首尾各 4 位，中间统一遮住 8 位（UID 与设备号同规则）
+const maskDigits = (v) => String(v == null ? "" : v).replace(/(\d{4})\d+(\d{4})/, "$1••••••••$2");
+function safeEqual(a, b) { // 逐字节比较，尽量避免可测量的时序差异（长度不等时提前返回）
   const enc = new TextEncoder();
   const x = enc.encode(a || ""), y = enc.encode(b || "");
   if (x.length !== y.length) return false;
@@ -133,7 +120,6 @@ function makeLogger() {
     info: (...a) => push("INFO", a),
     warn: (...a) => push("WARN", a),
     error: (...a) => push("ERROR", a),
-    debug: (...a) => push("DEBUG", a),
     text: () => lines.join("\n"),
   };
 }
@@ -155,8 +141,8 @@ async function getJSON(kv, key, def) {
     return raw ? JSON.parse(raw) : def;
   } catch { return def; }
 }
-async function setJSON(kv, key, val, opts) {
-  await kv.put(key, JSON.stringify(val), opts);
+async function setJSON(kv, key, val) {
+  await kv.put(key, JSON.stringify(val));
 }
 
 async function loadGuard(kv, uid) {
@@ -203,6 +189,8 @@ async function postJSON(url, body, headers = {}, retries = 3) {
 // ============================================================
 // 认证（对齐 build_login_url / parse_callback / ExchangeToken / GetUserInfo）
 // ============================================================
+// 401/403 = 登录态失效，需重新走 /callback
+const isAuthFail = (r) => !!r && (r._http_error === 401 || r._http_error === 403);
 function buildLoginUrl(machineId, deviceId) {
   const p = new URLSearchParams({
     login_version: "1", auth_from: "solo", login_channel: "native_ide",
@@ -347,6 +335,17 @@ async function provision(env, body, logger) {
   return { uid, nickname: acct.nickname, aha_device_id: aha, expires_at: expiresAt, expires_at_str: fmtCST(expiresAt) };
 }
 
+// KV 无 CAS，乐观锁尽力而为：TTL 自动回收异常残留的锁。
+// 签到与手动刷新共用同一把锁——exchangeToken 会轮换 refresh_token，
+// 两者并发时同用旧 refresh_token 可能互相把对方刷失效。
+// 返回是否真的取到了锁并执行了 fn（false = 已有运行在途，fn 未被调用）
+async function withAccountLock(kv, uid, trigger, fn) {
+  if (await kv.get(lockKey(uid))) return false;
+  await kv.put(lockKey(uid), JSON.stringify({ since: nowSec(), trigger }), { expirationTtl: LOCK_TTL });
+  try { await fn(); return true; }
+  finally { await kv.delete(lockKey(uid)).catch(() => {}); }
+}
+
 // ============================================================
 // 手动刷新全部账号 Token（/refresh，需 X-Admin-Token；不受 72h 阈值限制，强制换新）
 // ============================================================
@@ -358,27 +357,21 @@ async function refreshAllTokens(env) {
     const acct = await getJSON(kv, name, null);
     if (!acct || !acct.uid) continue;
     const summary = { uid: acct.uid, nickname: acct.nickname || "", refreshed: false, message: "" };
-    // 与签到共用同一把锁：exchangeToken 会轮换 refresh_token，
-    // 手动刷新与 Cron 签到并发时两边同用旧 refresh_token，可能互相把对方刷失效
-    if (await kv.get(lockKey(acct.uid))) {
-      summary.message = "已有运行在途，跳过（并发保护），稍后重试";
-      out.push(summary);
-      continue;
-    }
-    await kv.put(lockKey(acct.uid), JSON.stringify({ since: nowSec(), trigger: "refresh" }), { expirationTtl: LOCK_TTL });
-    try {
-      if (!acct.refresh_token) throw new Error("该账号无 refresh_token（历史兜底方式录入），需重新走 /callback 录入");
-      const tok = await exchangeToken(acct.refresh_token);
-      const updated = { ...acct, ...tok, updated_at: nowSec() };
-      await setJSON(kv, acctKey(acct.uid), updated);
-      summary.refreshed = true;
-      summary.message = `已刷新，有效期至 ${fmtCST(updated.expires_at)}`;
-      console.log("[refresh] UID", acct.uid, summary.message);
-    } catch (e) {
-      summary.message = (e instanceof AuthError ? "登录态已失效，需重新走 /callback 录入：" : "刷新失败：") + String((e && e.message) || e);
-    } finally {
-      await kv.delete(lockKey(acct.uid)).catch(() => {});
-    }
+    const locked = await withAccountLock(kv, acct.uid, "refresh", async () => {
+      try {
+        if (!acct.refresh_token) throw new Error("该账号无 refresh_token（历史兜底方式录入），需重新走 /callback 录入");
+        const tok = await exchangeToken(acct.refresh_token);
+        const updated = { ...acct, ...tok, updated_at: nowSec() };
+        await setJSON(kv, acctKey(acct.uid), updated);
+        summary.refreshed = true;
+        summary.message = `已刷新，有效期至 ${fmtCST(updated.expires_at)}`;
+        console.log("[refresh] UID", acct.uid, summary.message);
+      } catch (e) {
+        summary.message = (e instanceof AuthError ? "登录态已失效，需重新走 /callback 录入：" : "刷新失败：") + String((e && e.message) || e);
+        console.error("[refresh] UID", acct.uid, summary.message);
+      }
+    });
+    if (!locked) summary.message = "已有运行在途，跳过（并发保护），稍后重试";
     out.push(summary);
   }
   return { ran_at: fmtCST(nowSec()), count: out.length, accounts: out };
@@ -387,18 +380,11 @@ async function refreshAllTokens(env) {
 // ============================================================
 // 单账号一次运行（Cron / 手动共用；云端不睡眠，9074 交下一 Cron）
 // ============================================================
-async function runAccount(env, acct, { trigger, logger }) {
-  const kv = env.KV, uid = acct.uid;
+// 真正的签到流程。调用方须已持有该账号的锁（见 withAccountLock）
+async function claimForAccount(kv, acct, logger) {
+  const uid = acct.uid;
 
-  // —— 乐观并发锁（KV 无 CAS，尽力而为，TTL 自动回收）——
-  if (await kv.get(lockKey(uid))) {
-    logger.warn("已有运行在途，跳过（并发保护）");
-    return { ok: false, phase: "skipped", message: "并发跳过" };
-  }
-  await kv.put(lockKey(uid), JSON.stringify({ since: nowSec(), trigger }), { expirationTtl: LOCK_TTL });
-
-  try {
-    // —— 1) Token 预刷新 ——
+  // —— 1) Token 预刷新 ——
     let cred = acct;
     const remaining = (cred.expires_at || 0) - nowSec();
     if (remaining <= REFRESH_AHEAD_SEC) {
@@ -423,22 +409,27 @@ async function runAccount(env, acct, { trigger, logger }) {
     const guard = await loadGuard(kv, uid);
     const now = nowSec();
     if (guard.paused_until && now < guard.paused_until)
-      return { ok: false, phase: "skipped", message: `限频暂停至 ${fmtCST(guard.paused_until)}` };
-    if (guard.last_attempt && now - guard.last_attempt < MIN_CLAIM_INTERVAL_SEC)
-      return { ok: false, phase: "skipped", message: "距上次领取不足 30 分钟" };
-    if ((guard.daily_attempts || 0) >= MAX_DAILY_ATTEMPTS)
-      return { ok: false, phase: "skipped", message: "当日 claim 已达上限" };
+    return { ok: false, phase: "skipped", message: `限频暂停至 ${fmtCST(guard.paused_until)}` };
+  if (guard.last_attempt && now - guard.last_attempt < MIN_CLAIM_INTERVAL_SEC)
+    return { ok: false, phase: "skipped", message: "距上次领取不足 30 分钟" };
+  if ((guard.daily_attempts || 0) >= MAX_DAILY_ATTEMPTS)
+    return { ok: false, phase: "skipped", message: "当日 claim 已达上限" };
+  // 闸门落盘与「清空限频」在多个分支重复出现，各自收口成一句，避免散落写
+  const saveGuard = () => setJSON(kv, guardKey(uid), guard);
+  const clearRateLimit = async () => {
+    guard.consecutive_rate_limits = 0; guard.paused_until = null;
+    await saveGuard();
+  };
 
     // —— 3) 先免费查状态，已签即收手 ——
     logger.info("查询签到状态…");
     const status = await apiStatus(cred.access_token, aha);
-    if (status && (status._http_error === 401 || status._http_error === 403))
+    if (isAuthFail(status))
       throw new AuthError(`签到状态查询返回 HTTP ${status._http_error}，登录态已失效，需重新走 /callback 录入`);
     if (!status || status._http_error)
       return { ok: false, phase: "error", message: `签到状态查询失败（HTTP ${status ? status._http_error : "网络异常"}）` };
     if (status.checked_in) {
-      guard.consecutive_rate_limits = 0; guard.paused_until = null;
-      await setJSON(kv, guardKey(uid), guard);
+      await clearRateLimit();
       const message = (status.credits != null && status.credits !== "")
         ? `今日已签到，当前签到积分 ${status.credits}` : "今日已签到";
       logger.info(message);
@@ -454,11 +445,11 @@ async function runAccount(env, acct, { trigger, logger }) {
     try { result = await apiClaim(cred.access_token, aha); }
     catch (e) { // 网络层失败：回退计数，留给下一 Cron
       guard.daily_attempts = Math.max(0, guard.daily_attempts - 1);
-      await setJSON(kv, guardKey(uid), guard);
+      await saveGuard();
       return { ok: false, phase: "error", message: "领取请求失败：" + e.message };
     }
-    if (result._http_error === 401 || result._http_error === 403) {
-      await setJSON(kv, guardKey(uid), guard); // 先落 attempt 计数，再按登录失效上抛
+    if (isAuthFail(result)) {
+      await saveGuard(); // 先落 attempt 计数，再按登录失效上抛
       throw new AuthError(`领取接口返回 HTTP ${result._http_error}，登录态已失效，需重新走 /callback 录入`);
     }
     if (result._http_error) result = {
@@ -469,20 +460,18 @@ async function runAccount(env, acct, { trigger, logger }) {
 
     // 注意：不能写 result.code || 0。上游 HTTP 200 但 body 为空时 postJSON 返回 {}，
     // undefined 会被折成 0，从而被下面的 code === 0 误判为「签到成功」，还顺手清掉限频暂停状态。
-    const hasCode = result.code !== undefined && result.code !== null;
-    const code = hasCode ? Number(result.code) : null;
+    const code = result.code == null ? null : Number(result.code);
     const msg = result.message || "";
     const low = msg.toLowerCase();
 
-    if (!hasCode && !msg) { // 既无 code 也无 message：响应结构不可识别，按失败处理并留证
-      await setJSON(kv, guardKey(uid), guard); // 保留本次 attempt 计数，留给下一周期
+    if (code === null && !msg) { // 既无 code 也无 message：响应结构不可识别，按失败处理并留证
+      await saveGuard(); // 保留本次 attempt 计数，留给下一周期
       logger.warn("签到响应结构异常，原始返回：", JSON.stringify(result).slice(0, 300));
       return { ok: false, phase: "error", code: null, message: "签到响应结构异常（未返回 code/message），已按失败处理" };
     }
 
     if (code === 0 || low.includes("success")) {
-      guard.consecutive_rate_limits = 0; guard.paused_until = null;
-      await setJSON(kv, guardKey(uid), guard);
+      await clearRateLimit();
       // 本次新增积分：优先取 claim 返回的 credits；没有则再查一次免费 status，
       // 用领取前后的签到积分差值算出（领取前数值缺失时只展示当前值，不算差值以免虚报）
       let gained = Number(result.credits) || 0;
@@ -507,8 +496,7 @@ async function runAccount(env, acct, { trigger, logger }) {
     // 只用「已签到 / 已领取」等明确措辞：原来的 msg.includes("已") 会把
     // “请求已过期”“账号已在其他设备登录”之类错误也判成已签到并返回 ok:true
     if (low.includes("already") || /已(签到|领取|领过|签过)/.test(msg)) {
-      guard.consecutive_rate_limits = 0; guard.paused_until = null;
-      await setJSON(kv, guardKey(uid), guard);
+      await clearRateLimit();
       logger.info("今日已领取：", msg);
       return { ok: true, phase: "already", message: msg, checked_in: true };
     }
@@ -517,16 +505,26 @@ async function runAccount(env, acct, { trigger, logger }) {
       guard.consecutive_rate_limits = n;
       const pauseMin = BACKOFF_PAUSE_MIN[Math.min(n - 1, BACKOFF_PAUSE_MIN.length - 1)];
       guard.paused_until = now + pauseMin * 60;
-      await setJSON(kv, guardKey(uid), guard);
+      await saveGuard();
       logger.warn(`触发限频(code=${code})，暂停 ${pauseMin} 分钟至 ${fmtCST(guard.paused_until)}，等下一个 Cron`);
       return { ok: false, phase: "rate_limited", message: msg || "服务器繁忙 9074", paused_min: pauseMin, resume_at: guard.paused_until };
     }
-    await setJSON(kv, guardKey(uid), guard);
-    logger.warn("其他业务返回 code=", code, "msg=", msg);
-    return { ok: false, phase: "error", code, message: msg || `code ${code}` };
-  } finally {
-    await kv.delete(lockKey(uid)).catch(() => {});
+  await saveGuard();
+  logger.warn("其他业务返回 code=", code, "msg=", msg);
+  return { ok: false, phase: "error", code, message: msg || `code ${code}` };
+}
+
+// 并发保护 + 分发；取不到锁时只记一条 warn，不动任何 guard 状态
+async function runAccount(env, acct, { trigger, logger }) {
+  let summary = null;
+  const locked = await withAccountLock(env.KV, acct.uid, trigger, async () => {
+    summary = await claimForAccount(env.KV, acct, logger);
+  });
+  if (!locked) {
+    logger.warn("已有运行在途，跳过（并发保护）");
+    return { ok: false, phase: "skipped", message: "并发跳过" };
   }
+  return summary;
 }
 
 // 遍历所有账号；每个账号结束写 state + 一条 log
@@ -553,14 +551,24 @@ async function runAll(env, trigger) {
     } finally {
       const ts = nowSec();
       const tsMs = Date.now(); // 毫秒，避免同账号同秒多次运行覆盖日志
-      await setJSON(kv, stateKey(acct.uid), { last_run_at: ts, trigger, ...summary });
-      const logName = `log:${tsMs}:${acct.uid}`; // 时间戳在前：KV 键序即全局时间序
-      const body = `# ${acct.nickname || acct.uid}  ${fmtCST(ts)} (${trigger})\n` +
-        `结果：${summary.phase}  ${summary.message}\n\n${logger.text()}\n`;
-      await kv.put(logName, body, {
-        expirationTtl: LOG_TTL,
-        metadata: { ts, uid: acct.uid, nick: acct.nickname || "", ok: !!summary.ok, phase: summary.phase, trigger, msg: String(summary.message || "").slice(0, 80) },
-      });
+      // state 与日志的写入失败不能冒泡：这里是 for 循环的 finally，抛出会终止整个遍历，
+      // 后面所有账号本轮都不会被处理（单账号写失败会连累其他账号，属于最不该发生的故障）。
+      try {
+        await setJSON(kv, stateKey(acct.uid), { last_run_at: ts, trigger, ...summary });
+      } catch (e) {
+        logger.error("state 快照写入失败：", (e && e.message) || e);
+      }
+      try {
+        const body = `# ${acct.nickname || acct.uid}  ${fmtCST(ts)} (${trigger})\n` +
+          `结果：${summary.phase}  ${summary.message}\n\n${logger.text()}\n`;
+        await kv.put(`log:${tsMs}:${acct.uid}`, body, { // 时间戳在前：KV 键序即全局时间序
+          expirationTtl: LOG_TTL,
+          metadata: { ts, uid: acct.uid, nick: acct.nickname || "", ok: !!summary.ok, phase: summary.phase, trigger, msg: String(summary.message || "").slice(0, 80) },
+        });
+      } catch (e) {
+        logger.error("运行日志写入失败：", (e && e.message) || e);
+        console.error("[runAll] 日志写入失败 UID", acct.uid, (e && e.message) || e);
+      }
       out.push(summary);
     }
   }
@@ -631,14 +639,16 @@ function badge(phase) {
   return `<span class="badge" style="color:${color};background:${bg};">${escapeHtml(label)}</span>`;
 }
 
-// 执行来源的中文标签（与 workbuddy 版同款）：cron=定时触发，manual=手动访问 /run
+// 执行来源的中文标签：cron=定时触发，manual=手动访问 /run
 function triggerLabel(t) {
   if (!t) return "-";
   if (t === "cron") return "定时触发";
   if (t === "manual") return "手动 · /run";
-  if (t.indexOf("http:") === 0) return "手动 · " + t.slice(5); // 兼容 workbuddy 风格的取值
   return String(t);
 }
+
+// 账号显示名兜底：昵称缺失时用 UID 后 4 位（调用方均已确保有 uid）
+const acctName = (a) => a.nickname || "UID " + String(a.uid).slice(-4);
 
 // 工具条：首页 / 立即签到 / 运行日志 / 账号状态
 function toolbar() {
@@ -674,7 +684,7 @@ async function renderHome(env) {
     }
     if (accounts.length) {
       const lines = accounts.map((a) => {
-        const nm = a.nickname || (a.uid ? "UID " + String(a.uid).slice(-4) : "未命名");
+        const nm = acctName(a);
         const left = Math.floor(((a.expires_at || 0) - nowSec()) / 86400);
         let t = escapeHtml(nm);
         if (a.expires_at) {
@@ -709,7 +719,7 @@ async function renderHome(env) {
     '<div class="hd"><h2>Trae 签到 Worker</h2><span class="sub">云端自动签到 · Token 自动续期 · 幂等可重复执行</span></div>' +
     cronBlock +
     accBlock +
-    '<div class="btnrow" style="margin-top:6px;"><a href="/run">▶ 立即签到</a><a href="/logs">运行日志</a></div>' +
+    toolbar() +
     '<h3>可用操作</h3><div class="tbl-scroll"><table><tbody>' + rows + "</tbody></table></div>" +
     '<p class="sub" style="margin-top:12px;">提示：<code>/run</code>、<code>/status</code>、<code>/logs</code> 公开、浏览器可直接打开；录入/删除凭证与手动刷新 Token 的 <code>/login-url</code>、<code>/callback</code>、<code>/remove</code>、<code>/refresh</code> 需请求头 <code>X-Admin-Token</code>。程序调用时返回 JSON。</p>';
   return htmlRes(pageShell("Trae 签到 Worker", inner, false));
@@ -727,7 +737,7 @@ async function renderStatus(env) {
     any = true;
     const st = await getJSON(env.KV, stateKey(a.uid), {});
     const guard = await loadGuard(env.KV, a.uid);
-    const nm = a.nickname || (a.uid ? "UID " + String(a.uid).slice(-4) : "未命名");
+    const nm = acctName(a);
     const left = Math.floor(((a.expires_at || 0) - nowSec()) / 86400);
     const expireMiddle = !a.expires_at ? "-"
       : (left < 0 ? `<span style="color:#B03A3C;">已过期</span>` : "剩 " + left + " 天");
@@ -735,8 +745,8 @@ async function renderStatus(env) {
     // 逐字段转义后拼接（不要先拼好 HTML 再整体 escapeHtml——那样会把上面的 <span> 转成字面文本）。
     // expireMiddle / expireTail 之外的片段都可能含 KV 里的数据，这里统一 escapeHtml 兜住。
     const meta = [
-      escapeHtml("UID " + String(a.uid).replace(/(\d{4})\d+(\d{4})/, "$1••••$2")),
-      escapeHtml("设备号 " + String(a.aha_device_id || "-").replace(/(\d{4})\d+(\d{4})/, "$1••••••••$2")),
+      escapeHtml("UID " + maskDigits(a.uid)),
+      escapeHtml("设备号 " + maskDigits(a.aha_device_id || "-")),
       "Token 到期：" + expireMiddle + escapeHtml(expireTail),
       escapeHtml("上次运行：" + (st.last_run_at ? fmtCST(st.last_run_at) + " · " + triggerLabel(st.trigger) : "暂无")),
     ];
@@ -771,7 +781,7 @@ async function renderStatus(env) {
 /* —— /run：手动签到结果页 —— */
 function renderRunResult(result) {
   const cards = (result.accounts || []).map((s) => {
-    const nm = s.nickname || (s.uid ? "UID " + String(s.uid).slice(-4) : "未命名");
+    const nm = acctName(s);
     const meta = [];
     if (s.phase === "already" && s.credits != null) meta.push("当前签到积分 " + s.credits);
     else if (s.credits) meta.push("本次 +" + s.credits + " 积分");
@@ -789,21 +799,26 @@ function renderRunResult(result) {
 }
 
 /* —— /logs 日志列表（行内可展开完整日志，无独立详情页） —— */
-// 拉取日志键（自动翻页，上限 10 页防御异常数据量），按 metadata.ts 倒序取最近 LOG_LIST_LIMIT 条。
-// 兼容新旧两种键格式（log:uid:日期:ms 与 log:ms:uid）：排序与账号过滤一律依据 metadata，不依赖 KV 键序。
-async function listLogEntries(kv, filterUid) {
-  const all = [];
+// 遍历全部日志键（自动翻页，上限 10 页防御异常数据量），按 metadata.uid 过滤。
+// 兼容新旧两种键格式（log:uid:日期:ms 与 log:ms:uid）：排序与过滤一律依据 metadata，不依赖 KV 键序。
+async function* iterateLogKeys(kv, filterUid) {
   let cursor;
   for (let i = 0; i < 10; i++) {
     const page = await kv.list({ prefix: "log:", limit: 1000, cursor });
     for (const k of page.keys) {
       const m = k.metadata || {};
       if (filterUid && String(m.uid || "") !== String(filterUid)) continue;
-      all.push({ name: k.name, m });
+      yield { name: k.name, m };
     }
-    if (page.list_complete) break;
+    if (page.list_complete) return;
     cursor = page.cursor;
   }
+}
+
+// 按 metadata.ts 倒序取最近 LOG_LIST_LIMIT 条
+async function listLogEntries(kv, filterUid) {
+  const all = [];
+  for await (const e of iterateLogKeys(kv, filterUid)) all.push(e);
   all.sort((a, b) => (b.m.ts || 0) - (a.m.ts || 0));
   return all.slice(0, LOG_LIST_LIMIT);
 }
@@ -947,19 +962,10 @@ async function handleFetch(req, env) {
       await env.KV.delete(stateKey(uid));  // 最近运行快照
       let logsDeleted = 0;
       if (!body.keep_logs) {
-        // 按元数据 uid 匹配删除该账号的历史日志
-        let cursor;
-        for (let i = 0; i < 10; i++) {
-          const page = await env.KV.list({ prefix: "log:", limit: 1000, cursor });
-          for (const k of page.keys) {
-            const m = k.metadata || {};
-            if (String(m.uid || "") === uid) {
-              await env.KV.delete(k.name);
-              logsDeleted++;
-            }
-          }
-          if (page.list_complete) break;
-          cursor = page.cursor;
+        // 按元数据 uid 匹配删除该账号的历史日志（复用 /logs 的翻页遍历）
+        for await (const k of iterateLogKeys(env.KV, uid)) {
+          await env.KV.delete(k.name);
+          logsDeleted++;
         }
       }
       return new Response(JSON.stringify({ ok: true, uid, deleted: ["acct", "guard", "state"], logs_deleted: logsDeleted }), { headers: JSON_H });
@@ -977,13 +983,22 @@ async function handleFetch(req, env) {
 
 // /logs 的 JSON 输出（复用列表逻辑；uid 打码、不暴露键名，与页面脱敏一致）
 async function renderLogsJson(env, filterUid) {
-  const mask = (v) => String(v || "").replace(/(\d{4})\d+(\d{4})/, "$1••••$2");
   const logs = (await listLogEntries(env.KV, filterUid)).map((k) => ({
-    ts: k.m.ts, uid: mask(k.m.uid), nick: k.m.nick, ok: k.m.ok, phase: k.m.phase,
+    ts: k.m.ts, uid: maskDigits(k.m.uid), nick: k.m.nick, ok: k.m.ok, phase: k.m.phase,
     trigger: k.m.trigger || null, // 历史日志的 metadata 无此字段（不读正文，保持接口轻量）
     msg: k.m.msg,
   }));
   return new Response(JSON.stringify({ count: logs.length, logs }), { headers: JSON_H });
+}
+
+// Cron 自身（与账号无关）的兜底留痕：遍历前失败、或 0 账号时各写一条，
+// 让「触发器没被调用」与「调用了但没配账号」在 /logs 上永远可区分。
+async function writeCronLog(kv, { phase, ok, msg, body }) {
+  const ts = nowSec(), tsMs = Date.now();
+  await kv.put(`log:${tsMs}:cron`, `# CRON  ${fmtCST(ts)} (cron)\n结果：${phase}  ${msg}\n\n${body}\n`, {
+    expirationTtl: LOG_TTL,
+    metadata: { ts, uid: "", nick: "CRON", ok, phase, trigger: "cron", msg: String(msg).slice(0, 80) },
+  });
 }
 
 export default {
@@ -1017,13 +1032,7 @@ export default {
       const msg = String((e && e.message) || e);
       console.error("cron runAll 失败：", msg);
       try {
-        const ts = nowSec(), tsMs = Date.now();
-        await env.KV.put(`log:${tsMs}:cron`,
-          `# CRON  ${fmtCST(ts)} (cron)\n结果：error  ${msg}\n\n[FATAL] 账号遍历前失败：${msg}\n`,
-          {
-            expirationTtl: LOG_TTL,
-            metadata: { ts, uid: "", nick: "CRON", ok: false, phase: "error", trigger: "cron", msg: msg.slice(0, 80) },
-          });
+        await writeCronLog(env.KV, { phase: "error", ok: false, msg, body: `[FATAL] 账号遍历前失败：${msg}` });
       } catch {}
       return; // 已在上面留了 FATAL 日志，不再往下补「0 账号」那条
     }
@@ -1031,13 +1040,10 @@ export default {
     // 结果「没配账号」和「触发器没跑」在 /logs 上长得一模一样。补一条留痕，让 cron 是否执行过永远可查。
     if (!result || !result.count) {
       try {
-        const ts = nowSec(), tsMs = Date.now();
-        await env.KV.put(`log:${tsMs}:cron`,
-          `# CRON  ${fmtCST(ts)} (cron)\n结果：skipped  未配置任何账号\n\n[WARN] 本次 Cron 已执行，但 KV 中没有 acct: 账号，无需签到。\n`,
-          {
-            expirationTtl: LOG_TTL,
-            metadata: { ts, uid: "", nick: "CRON", ok: true, phase: "skipped", trigger: "cron", msg: "cron 已执行，但未配置任何账号" },
-          });
+        await writeCronLog(env.KV, {
+          phase: "skipped", ok: true, msg: "cron 已执行，但未配置任何账号",
+          body: "[WARN] 本次 Cron 已执行，但 KV 中没有 acct: 账号，无需签到。",
+        });
       } catch {}
     }
   },
